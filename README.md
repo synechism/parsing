@@ -56,12 +56,12 @@ That proves GPU acceleration is active. It does not prove throughput is maximize
 
 ## Concurrency Model
 
-Default concurrency is `1` in both public layers:
+The validated L40S default is `4` in both public layers:
 
-- `MINERU_API_MAX_CONCURRENT_REQUESTS=1`
-- `WORKER_CONCURRENCY=1`
+- `MINERU_API_MAX_CONCURRENT_REQUESTS=4`
+- `WORKER_CONCURRENCY=4`
 
-This means there is no inter-document parallelism by default. That is deliberate as a safe first production setting, not a claim that it is optimal.
+This means up to four whole-document jobs can be in flight through this platform and MinerU at once. The original safe baseline was `1`, which is still the right fallback for unknown GPUs, very long PDFs, or when debugging stability. On this L40S, `1` was too conservative for normal complex PDFs.
 
 The system still has internal parallelism at concurrency `1`:
 
@@ -70,27 +70,36 @@ The system still has internal parallelism at concurrency `1`:
 - vLLM batches model work internally and keeps the VLM model warm on GPU.
 - OCR/layout/table/image work can use CPU threads and GPU kernels inside a single document parse.
 
-However, if many agents submit many PDFs, `WORKER_CONCURRENCY=1` serializes whole documents at the platform layer. That maximizes stability and minimizes out-of-memory risk, but it leaves potential throughput on the table.
+If many agents submit many PDFs, `WORKER_CONCURRENCY` controls whole-document parallelism at the platform layer. It should usually match `MINERU_API_MAX_CONCURRENT_REQUESTS` unless a separate router or priority scheduler is added.
 
 ### Throughput Tuning
 
-For a single L40S, test these settings in order:
+For a single L40S, the current validated setting is:
 
 ```bash
-WORKER_CONCURRENCY=2 \
-MINERU_API_MAX_CONCURRENT_REQUESTS=2 \
+WORKER_CONCURRENCY=4 \
+MINERU_API_MAX_CONCURRENT_REQUESTS=4 \
 docker compose up -d --force-recreate
 ```
 
-Then:
+Validation run:
 
 ```bash
-python3 scripts/run_e2e.py --api-url http://127.0.0.1:8080 --concurrency 2
+python3 scripts/run_e2e.py --api-url http://127.0.0.1:8080 --concurrency 4
 nvidia-smi
 curl http://127.0.0.1:8080/health
 ```
 
-If that is stable, try `3`, then `4`. Stop when one of these happens:
+Observed results on this host:
+
+```text
+concurrency=2: four-PDF corpus completed, no failed jobs
+concurrency=3: four-PDF corpus completed, no failed jobs
+concurrency=4: four-PDF corpus completed, no failed jobs, total elapsed 30.98s
+peak observed VRAM at concurrency=4: 43684 MiB / 46068 MiB
+```
+
+Stop increasing concurrency when one of these happens:
 
 - GPU memory gets close to the 46 GiB limit.
 - MinerU starts returning failed tasks.
@@ -108,12 +117,12 @@ Recommended approach:
 
 ```text
 stable baseline:       WORKER_CONCURRENCY=1, MINERU_API_MAX_CONCURRENT_REQUESTS=1
-first throughput test: WORKER_CONCURRENCY=2, MINERU_API_MAX_CONCURRENT_REQUESTS=2
-likely upper range:    2-4 concurrent complex PDFs on one L40S, benchmark required
+validated L40S value:  WORKER_CONCURRENCY=4, MINERU_API_MAX_CONCURRENT_REQUESTS=4
+next experiment:       try 5+ only with a larger stress corpus and active OOM monitoring
 multi-GPU scaling:     run one MinerU worker per GPU and route across workers
 ```
 
-Do not run multiple full MinerU VLM containers on one L40S unless memory use has been measured. Each container can reserve a large vLLM cache, so multiple containers may waste VRAM compared with one container using controlled request concurrency.
+Do not run multiple full MinerU VLM containers on one L40S unless memory use has been measured. Each container can reserve a large vLLM cache, so multiple containers may waste VRAM compared with one container using controlled request concurrency. With `GPU_MEMORY_UTILIZATION=0.9` and concurrency `4`, this host already runs fairly close to the VRAM ceiling.
 
 ## Design Decisions
 
@@ -170,7 +179,7 @@ Preferred progression:
 
 ```text
 1. One GPU, one MinerU container, concurrency 1 for correctness.
-2. One GPU, one MinerU container, concurrency 2-4 after benchmarking.
+2. One GPU, one MinerU container, concurrency 4 on this L40S after benchmarking.
 3. Multiple GPUs, one MinerU container per GPU.
 4. Add a router or scheduler that assigns jobs based on queue depth and health.
 ```

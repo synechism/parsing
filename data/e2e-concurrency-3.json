@@ -1,0 +1,38 @@
+[
+  {
+    "pdf": "data/test-pdfs/attention.pdf",
+    "job_id": "8f87417a1afd47c5b83ebad417a90694",
+    "status": "completed",
+    "has_markdown": true,
+    "has_table_signal": true,
+    "has_image_signal": true,
+    "result_bytes": 768550
+  },
+  {
+    "pdf": "data/test-pdfs/doclaynet.pdf",
+    "job_id": "4528743c051544c0982434056e5401dd",
+    "status": "completed",
+    "has_markdown": true,
+    "has_table_signal": true,
+    "has_image_signal": true,
+    "result_bytes": 909942
+  },
+  {
+    "pdf": "data/test-pdfs/layoutparser.pdf",
+    "job_id": "c4a702f2b493487cad298258b62450e8",
+    "status": "completed",
+    "has_markdown": true,
+    "has_table_signal": true,
+    "has_image_signal": true,
+    "result_bytes": 831018
+  },
+  {
+    "pdf": "data/test-pdfs/mineru.pdf",
+    "job_id": "8d54323c90214278af04aa9d485be707",
+    "status": "completed",
+    "has_markdown": true,
+    "has_table_signal": true,
+    "has_image_signal": true,
+    "result_bytes": 708526
+  }
+]
