@@ -1,0 +1,7 @@
+services:
+  mineru:
+    build:
+      context: .
+      dockerfile: docker/mineru.Dockerfile
+    image: pdfparse-mineru:local
+
