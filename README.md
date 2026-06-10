@@ -297,13 +297,20 @@ This keeps the judgement grounded in MinerU's parsed output rather than native m
 
 ### Coordinate Design
 
-MinerU emits multiple coordinate spaces. The correct source for redlining is `middle_json`, not `content_list`.
+MinerU emits multiple coordinate spaces. The correct source for anchoring the table on the page is `middle_json`, not `content_list`.
 
 - `content_list.table_body` is used for table HTML and cell text.
 - `middle_json.pdf_info[].page_size` is used for PDF page size.
 - `middle_json` table span `bbox` is used for page-space table location.
 
-The observed MinerU output does not include true per-cell bounding boxes. The implementation derives cell bboxes by splitting the precise MinerU table-body bbox according to the parsed HTML row/column grid. This is why the redline boxes now align with the table: all redline coordinates come from the same page-space coordinate system.
+The observed MinerU output does not include true per-cell bounding boxes. The implementation now uses a two-stage geometry strategy:
+
+1. Build a logical cell grid from MinerU's table HTML, including row/column indexes and spans.
+2. For PDF inputs, render the relevant PDF page with Poppler and detect real horizontal/vertical table ruling lines inside MinerU's table-body bbox.
+3. Use those detected line positions as non-uniform row and column boundaries.
+4. Fall back to uniform splitting of the MinerU table bbox only when ruling-line detection is unavailable or cannot find the expected grid.
+
+That means regular tables still work, and bordered irregular tables with uneven column widths or row heights can be redlined accurately. The `geometrySource` field on extracted tables/cells is `pdf_ruling_lines` when the precision layer was used and `uniform_grid` when the fallback was used.
 
 ### Table Compare API
 
@@ -353,6 +360,7 @@ The fixture generator currently writes:
 - `changed-header-and-body.pdf`: one header change and one body change, `B1` and `C5`.
 - `changed-many-cells.pdf`: six changed cells across multiple rows/columns.
 - `added-row.pdf`: table shape change plus added cells `A6:D6`.
+- `irregular-base.pdf` and `irregular-changed.pdf`: uneven column widths and row heights, expecting `B3` and `D5`.
 
 The fixture truth is recorded in `data/table-fixtures/manifest.json`, and the e2e test reads that manifest directly.
 
@@ -360,6 +368,8 @@ The local deterministic tests assert:
 
 - the extractor prefers `middle_json` page-space bboxes over `content_list` rendered-image bboxes;
 - `C3` and `D4` cell boxes are derived correctly inside the MinerU table bbox;
+- irregular table comparisons use `pdf_ruling_lines`, not the uniform fallback;
+- irregular table cell boxes are materially non-uniform, proving actual PDF grid boundaries were used;
 - identical tables return `different=false`;
 - changed tables return `different=true`;
 - the written `explanation` names exact cells and before/after values;

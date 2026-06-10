@@ -36,12 +36,14 @@
     "mastra": "^1.12.2",
     "multer": "^2.1.1",
     "pdf-lib": "^1.17.1",
+    "pngjs": "^7.0.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/multer": "^2.1.0",
     "@types/node": "^25.9.2",
+    "@types/pngjs": "^6.0.5",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }

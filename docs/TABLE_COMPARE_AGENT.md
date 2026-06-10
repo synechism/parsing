@@ -14,8 +14,9 @@ Request flow:
    - table HTML from `table_body`
    - precise page-space table body bounding boxes from `middle_json` table spans
    - page geometry from `middle_json.pdf_info[].page_size`
-6. The comparator normalizes table HTML into a cell grid and compares cells by spreadsheet-style refs such as `C3`.
-7. The redline renderer draws red boxes on top of document B and writes `redline.pdf`.
+6. For PDF inputs, the geometry refiner renders the page and detects actual table ruling lines inside the MinerU table bbox.
+7. The comparator normalizes table HTML into a cell grid and compares cells by spreadsheet-style refs such as `C3`.
+8. The redline renderer draws red boxes on top of document B and writes `redline.pdf`.
 
 The API does not wait for parsing to finish. It returns a job id immediately and exposes polling endpoints, matching the async pattern used by the existing Python parse API.
 
@@ -27,7 +28,7 @@ The comparison is intentionally grounded in MinerU structured output rather than
 - Table location comes from MinerU table-body bounding boxes in `middle_json`.
 - Page coordinate mapping comes from MinerU page sizes.
 
-In the current observed MinerU output, precise table-body boxes are available in page coordinates, but cell-level boxes are not. The implementation derives cell boxes by splitting the MinerU table-body bbox according to the parsed row and column grid. If a future MinerU version emits true cell boxes, `src/table-compare/table-extractor.ts` is the right place to prefer those directly.
+In the current observed MinerU output, precise table-body boxes are available in page coordinates, but cell-level boxes are not. The implementation first builds a logical grid from MinerU table HTML, then uses PDF ruling-line detection to recover non-uniform row and column boundaries for bordered PDF tables. If that precision layer cannot run, it falls back to splitting the MinerU table-body bbox according to the parsed row and column grid. If a future MinerU version emits true cell boxes, `src/table-compare/table-extractor.ts` and `src/table-compare/table-geometry.ts` are the right places to prefer those directly.
 
 ## Files
 
@@ -35,6 +36,7 @@ In the current observed MinerU output, precise table-body boxes are available in
 - `src/table-compare/job-manager.ts`: in-memory queue, upload persistence, worker concurrency, and job state.
 - `src/table-compare/mineru-client.ts`: local MinerU `/tasks` client with submit, poll, and result retrieval.
 - `src/table-compare/table-extractor.ts`: converts MinerU output into tables, cells, bboxes, and page geometry.
+- `src/table-compare/table-geometry.ts`: renders PDF pages with Poppler and detects actual table ruling lines for non-uniform cell bboxes.
 - `src/table-compare/table-compare.ts`: deterministic cell-by-cell comparison logic.
 - `src/table-compare/redline.ts`: PDF overlay rendering with `pdf-lib`.
 - `src/table-compare/workflow.ts`: orchestration used by the API.

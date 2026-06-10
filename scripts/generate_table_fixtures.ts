@@ -8,6 +8,8 @@ interface Fixture {
   name: string;
   title: string;
   rows: string[][];
+  colWidths?: string[];
+  rowHeights?: string[];
 }
 
 interface ExpectedDifference {
@@ -103,6 +105,26 @@ const fixtures: Fixture[] = [
       ["Central", "$87,000", "$91,200", "Review"],
     ],
   },
+  {
+    name: "irregular-base",
+    title: "Irregular Revenue Table",
+    colWidths: ["18%", "34%", "20%", "28%"],
+    rowHeights: ["42px", "34px", "74px", "46px", "62px"],
+    rows: baseRows,
+  },
+  {
+    name: "irregular-changed",
+    title: "Irregular Revenue Table",
+    colWidths: ["18%", "34%", "20%", "28%"],
+    rowHeights: ["42px", "34px", "74px", "46px", "62px"],
+    rows: [
+      ["Region", "Q1 Revenue", "Q2 Revenue", "Status"],
+      ["North", "$120,000", "$135,500", "Approved"],
+      ["South", "$99,999", "$101,750", "Approved"],
+      ["East", "$143,100", "$149,900", "Review"],
+      ["West", "$110,300", "$118,400", "Pending"],
+    ],
+  },
 ];
 
 const cases: FixtureCase[] = [
@@ -171,6 +193,16 @@ const cases: FixtureCase[] = [
       { kind: "cell_added", ref: "D6", before: null, after: "Review" },
     ],
   },
+  {
+    name: "irregular-base-vs-irregular-changed",
+    documentA: "irregular-base.pdf",
+    documentB: "irregular-changed.pdf",
+    different: true,
+    differences: [
+      { kind: "cell_changed", ref: "B3", before: "$98,250", after: "$99,999" },
+      { kind: "cell_changed", ref: "D5", before: "Approved", after: "Pending" },
+    ],
+  },
 ];
 
 await mkdir(outputDir, { recursive: true });
@@ -214,9 +246,13 @@ function renderHtml(fixture: Fixture): string {
   const rows = fixture.rows
     .map((row, rowIndex) => {
       const cellTag = rowIndex === 0 ? "th" : "td";
-      return `<tr>${row.map((cell) => `<${cellTag}>${escapeHtml(cell)}</${cellTag}>`).join("")}</tr>`;
+      const rowStyle = fixture.rowHeights?.[rowIndex] ? ` style="height: ${fixture.rowHeights[rowIndex]}"` : "";
+      return `<tr${rowStyle}>${row.map((cell) => `<${cellTag}>${escapeHtml(cell)}</${cellTag}>`).join("")}</tr>`;
     })
     .join("\n");
+  const colgroup = fixture.colWidths
+    ? `<colgroup>${fixture.colWidths.map((width) => `<col style="width: ${width}" />`).join("")}</colgroup>`
+    : "";
 
   return `<!doctype html>
 <html>
@@ -237,6 +273,7 @@ function renderHtml(fixture: Fixture): string {
     <h1>${escapeHtml(fixture.title)}</h1>
     <table>
       <caption>Revenue approval matrix</caption>
+      ${colgroup}
       <tbody>
         ${rows}
       </tbody>

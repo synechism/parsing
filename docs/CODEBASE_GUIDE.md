@@ -265,7 +265,19 @@ Responsibilities:
 - parses table HTML with `cheerio`;
 - normalizes cell text;
 - assigns spreadsheet-style cell refs;
-- derives per-cell bboxes inside the MinerU table bbox.
+- creates initial per-cell bboxes inside the MinerU table bbox.
+
+### `src/table-compare/table-geometry.ts`
+
+Refines table/cell geometry for PDF inputs.
+
+Responsibilities:
+
+- renders PDF pages with `pdftoppm`;
+- reads rendered PNGs with `pngjs`;
+- detects horizontal and vertical ruling-line clusters inside MinerU's table-body bbox;
+- replaces uniform cell boxes with non-uniform boxes from the detected grid;
+- falls back to the extractor's uniform boxes when the detector cannot find the expected boundaries.
 
 ### `src/table-compare/table-compare.ts`
 

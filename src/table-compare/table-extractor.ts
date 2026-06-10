@@ -141,6 +141,7 @@ function buildExtractedTable(
   const cells: ExtractedCell[] = grid.map((cell) => ({
     ...cell,
     ref: cellRef(cell.rowIndex, cell.colIndex),
+    geometrySource: "uniform_grid",
     bbox: [
       bbox[0] + cell.colIndex * cellWidth,
       bbox[1] + cell.rowIndex * cellHeight,
@@ -162,6 +163,7 @@ function buildExtractedTable(
     rowCount,
     colCount,
     cells,
+    geometrySource: "uniform_grid",
   };
 }
 

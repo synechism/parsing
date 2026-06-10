@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { MinerUClient } from "../../table-compare/mineru-client";
 import { extractTablesFromMinerUResult } from "../../table-compare/table-extractor";
+import { refineDocumentTablesWithPdfRulingLines } from "../../table-compare/table-geometry";
 
 function mineruClient(): MinerUClient {
   return new MinerUClient({
@@ -27,7 +28,10 @@ export const parseDocumentTablesTool = createTool({
   }),
   execute: async ({ filePath, fileName }) => {
     const parsed = await mineruClient().parseDocument(filePath);
-    const tables = extractTablesFromMinerUResult(parsed.result, fileName ?? filePath, parsed.taskId);
+    const tables = await refineDocumentTablesWithPdfRulingLines(
+      filePath,
+      extractTablesFromMinerUResult(parsed.result, fileName ?? filePath, parsed.taskId),
+    );
     return {
       fileName: tables.fileName,
       mineruTaskId: tables.mineruTaskId,

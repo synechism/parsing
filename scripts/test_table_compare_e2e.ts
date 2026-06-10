@@ -20,11 +20,26 @@ for (const testCase of manifest.cases) {
   assertExpectedDifferences(testCase.name, result.differences, testCase.differences);
   assertExplanation(testCase, result);
 
+  assert.equal(result.tableB.geometrySource, "pdf_ruling_lines", `${testCase.name} should use detected PDF ruling lines`);
+
   if (testCase.name === "base-vs-changed") {
-    assert.deepEqual(result.tableB.bbox, [58, 110, 553, 258], "redline source bbox must be middle_json page-space bbox");
     assert.deepEqual(result.tableB.pageSize, [612, 792]);
-    assertBBox(result.differences[0].bboxB, [305.5, 169.2, 429.25, 198.8], "C3 API bbox");
-    assertBBox(result.differences[1].bboxB, [429.25, 198.8, 553, 228.4], "D4 API bbox");
+    assertBBoxApprox(result.differences[0].bboxB, [306, 169.5, 429, 199], 4, "C3 API bbox");
+    assertBBoxApprox(result.differences[1].bboxB, [429, 199, 553, 228.5], 4, "D4 API bbox");
+  }
+
+  if (testCase.name === "irregular-base-vs-irregular-changed") {
+    const b3 = result.differences.find((diff) => diff.ref === "B3");
+    const d5 = result.differences.find((diff) => diff.ref === "D5");
+    assert.ok(b3?.bboxB, "irregular B3 should have a bbox");
+    assert.ok(d5?.bboxB, "irregular D5 should have a bbox");
+    const tableWidth = result.tableB.bbox[2] - result.tableB.bbox[0];
+    const tableHeight = result.tableB.bbox[3] - result.tableB.bbox[1];
+    const uniformWidth = tableWidth / result.tableB.colCount;
+    const uniformHeight = tableHeight / result.tableB.rowCount;
+    assert.ok(bboxWidth(b3.bboxB) > uniformWidth * 1.2, "irregular B column should be wider than uniform fallback");
+    assert.ok(bboxHeight(b3.bboxB) > uniformHeight * 1.25, "irregular row 3 should be taller than uniform fallback");
+    assert.ok(bboxHeight(d5.bboxB) > uniformHeight * 1.05, "irregular row 5 should be taller than uniform fallback");
   }
 
   await downloadRedline(result.jobId, path.join(artifactDir, `${testCase.name}-redline.pdf`));
@@ -85,11 +100,22 @@ async function assertHttpStatus(response: Response, expected: number, label: str
   }
 }
 
-function assertBBox(actual: number[] | undefined, expected: number[], label: string): void {
+function assertBBoxApprox(actual: number[] | undefined, expected: number[], tolerance: number, label: string): void {
   assert.ok(actual, `${label} should exist`);
   for (const [index, value] of actual.entries()) {
-    assert.ok(Math.abs(value - expected[index]) < 0.001, `${label}[${index}] expected ${expected[index]}, got ${value}`);
+    assert.ok(
+      Math.abs(value - expected[index]) <= tolerance,
+      `${label}[${index}] expected ${expected[index]} +/- ${tolerance}, got ${value}`,
+    );
   }
+}
+
+function bboxWidth(bbox: number[]): number {
+  return bbox[2] - bbox[0];
+}
+
+function bboxHeight(bbox: number[]): number {
+  return bbox[3] - bbox[1];
 }
 
 function assertExpectedDifferences(
@@ -139,6 +165,9 @@ interface TableCompareResult {
   tableB: {
     bbox: number[];
     pageSize: number[];
+    rowCount: number;
+    colCount: number;
+    geometrySource: string;
   };
 }
 

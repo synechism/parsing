@@ -2,6 +2,7 @@ import path from "node:path";
 
 import { compareFirstTables } from "./table-compare";
 import { extractTablesFromMinerUResult } from "./table-extractor";
+import { refineDocumentTablesWithPdfRulingLines } from "./table-geometry";
 import { createRedlinePdf } from "./redline";
 import type { MinerUClient } from "./mineru-client";
 import type { MinerUOptions, TableComparisonResult } from "./types";
@@ -20,8 +21,18 @@ export async function compareTwoDocuments(input: CompareTwoDocumentsInput): Prom
     input.mineru.parseDocument(input.documentBPath, input.options),
   ]);
 
-  const tablesA = extractTablesFromMinerUResult(parsedA.result, path.basename(input.documentAPath), parsedA.taskId);
-  const tablesB = extractTablesFromMinerUResult(parsedB.result, path.basename(input.documentBPath), parsedB.taskId);
+  const [tablesA, tablesB] = await Promise.all([
+    refineDocumentTablesWithPdfRulingLines(
+      input.documentAPath,
+      extractTablesFromMinerUResult(parsedA.result, path.basename(input.documentAPath), parsedA.taskId),
+      path.join(input.outputDirectory, "geometry-a"),
+    ),
+    refineDocumentTablesWithPdfRulingLines(
+      input.documentBPath,
+      extractTablesFromMinerUResult(parsedB.result, path.basename(input.documentBPath), parsedB.taskId),
+      path.join(input.outputDirectory, "geometry-b"),
+    ),
+  ]);
 
   if (tablesA.tables.length === 0 || tablesB.tables.length === 0) {
     throw new Error(

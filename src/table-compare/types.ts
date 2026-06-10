@@ -27,6 +27,7 @@ export interface ExtractedCell {
   text: string;
   bbox: BBox;
   ref: string;
+  geometrySource: "uniform_grid" | "pdf_ruling_lines";
 }
 
 export interface ExtractedTable {
@@ -39,6 +40,7 @@ export interface ExtractedTable {
   rowCount: number;
   colCount: number;
   cells: ExtractedCell[];
+  geometrySource: "uniform_grid" | "pdf_ruling_lines";
 }
 
 export interface ParsedDocumentTables {
