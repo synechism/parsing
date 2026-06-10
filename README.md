@@ -262,6 +262,140 @@ mineru.pdf       completed, markdown=true, table=true, image=true, result_bytes=
 - `GET /v1/jobs/{job_id}/result`: returns `202` until ready, `409` on failure, parsed JSON on success.
 - `GET /health`: checks this API, queue counts, and MinerU health.
 
+## Mastra Table Comparison Agent
+
+This repo also includes a Mastra agent and async API for comparing tables in two documents using MinerU structured output.
+
+### Table Compare Runtime Shape
+
+The table comparison path is a separate Node service named `table-agent`:
+
+```text
+agent/client
+  -> POST /v1/table-comparisons on table-agent
+  -> table-agent saves documentA and documentB under /data/table-compare/input/<job_id>
+  -> table-agent enqueues a comparison job and returns 202 immediately
+  -> worker submits both documents to MinerU POST /tasks concurrently
+  -> MinerU parses each document on CUDA
+  -> table-agent extracts table HTML, page geometry, and table bboxes from MinerU output
+  -> deterministic comparator compares parsed cells by refs like C3 and D4
+  -> redline renderer draws boxes on document B and writes /data/table-compare/results/<job_id>/redline.pdf
+  -> agent/client polls /v1/table-comparisons/<job_id>/result
+```
+
+The Mastra agent definitions live under `src/mastra`, and the deterministic API/runtime lives under `src/table-compare`.
+
+### Why The Agent Uses Tools
+
+The agent is not asked to visually guess table differences. Its tools force the workflow through MinerU first:
+
+- `parse-document-tables-with-mineru`: calls the local MinerU API and extracts structured tables.
+- `compare-mineru-parsed-tables`: compares normalized parsed cell text.
+- `create-table-redline-pdf`: renders a visual PDF redline from MinerU-derived coordinates.
+
+This keeps the judgement grounded in MinerU's parsed output rather than native multimodal inspection. The LLM-facing Mastra agent can explain or orchestrate, but the actual pass/fail comparison is deterministic code.
+
+### Coordinate Design
+
+MinerU emits multiple coordinate spaces. The correct source for redlining is `middle_json`, not `content_list`.
+
+- `content_list.table_body` is used for table HTML and cell text.
+- `middle_json.pdf_info[].page_size` is used for PDF page size.
+- `middle_json` table span `bbox` is used for page-space table location.
+
+The observed MinerU output does not include true per-cell bounding boxes. The implementation derives cell bboxes by splitting the precise MinerU table-body bbox according to the parsed HTML row/column grid. This is why the redline boxes now align with the table: all redline coordinates come from the same page-space coordinate system.
+
+### Table Compare API
+
+Run it with Docker:
+
+```bash
+docker compose up --build mineru table-agent
+```
+
+Submit two documents:
+
+```bash
+curl -X POST http://127.0.0.1:8090/v1/table-comparisons \
+  -F "documentA=@data/table-fixtures/base.pdf" \
+  -F "documentB=@data/table-fixtures/changed.pdf"
+```
+
+The result includes:
+
+- `different`: boolean judgement.
+- `summary`, `explanation`, and `differences`: changed cell refs plus before/after text.
+- `redlinePdfPath`: PDF with changed table cells marked in red.
+
+### Table Compare Tests
+
+Generate deterministic PDF fixtures through Gotenberg:
+
+```bash
+docker compose --profile fixtures up -d gotenberg
+npm run generate:table-fixtures
+docker compose --profile fixtures stop gotenberg
+```
+
+Run the local deterministic tests:
+
+```bash
+npm run test:table-unit
+```
+
+The fixture generator currently writes:
+
+- `base.pdf`: source table.
+- `identical.pdf`: no changes.
+- `changed.pdf`: two body-cell changes, `C3` and `D4`.
+- `changed-single-cell.pdf`: one body-cell change, `B4`.
+- `changed-edge-cells.pdf`: first data cell and last data cell changes, `A2` and `D5`.
+- `changed-header-and-body.pdf`: one header change and one body change, `B1` and `C5`.
+- `changed-many-cells.pdf`: six changed cells across multiple rows/columns.
+- `added-row.pdf`: table shape change plus added cells `A6:D6`.
+
+The fixture truth is recorded in `data/table-fixtures/manifest.json`, and the e2e test reads that manifest directly.
+
+The local deterministic tests assert:
+
+- the extractor prefers `middle_json` page-space bboxes over `content_list` rendered-image bboxes;
+- `C3` and `D4` cell boxes are derived correctly inside the MinerU table bbox;
+- identical tables return `different=false`;
+- changed tables return `different=true`;
+- the written `explanation` names exact cells and before/after values;
+- redline PDF generation produces a valid PDF.
+
+Run the live Docker/API e2e tests:
+
+```bash
+docker compose up -d mineru table-agent
+npm run test:table-e2e
+docker compose stop table-agent mineru
+```
+
+The e2e test submits every manifest case, verifies the exact expected diff refs and before/after values, downloads every redline PDF, and checks each downloaded file is a valid PDF.
+
+For visual inspection, render a redline with Poppler:
+
+```bash
+docker run --rm -v "$PWD:/work" minidocks/poppler \
+  pdftoppm -png -singlefile -r 144 \
+  /work/data/table-compare/test-artifacts/base-vs-changed-many-cells-redline.pdf \
+  /work/data/table-compare/test-artifacts/base-vs-changed-many-cells-redline
+```
+
+See `docs/TABLE_COMPARE_AGENT.md` for the full file map and fixture workflow.
+
+### Node Dependencies
+
+Node dependencies are intentionally tracked through `package.json` and `package-lock.json`, not by committing or keeping `node_modules` as source. Recreate dependencies when needed:
+
+```bash
+npm ci
+```
+
+Docker builds also use `npm ci`, so the `table-agent` image does not require host `node_modules`.
+
 ## Local Development
 
 Host Python on this machine currently does not have `pip` installed for `/usr/bin/python3`, so Docker is the primary path. If you want a local dev env:
