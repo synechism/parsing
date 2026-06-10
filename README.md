@@ -270,20 +270,29 @@ This repo also includes a Mastra agent and async API for comparing tables in two
 
 The table comparison path is a separate Node service named `table-agent`:
 
-```text
-agent/client
-  -> POST /v1/table-comparisons on table-agent
-  -> table-agent saves documentA and documentB under /data/table-compare/input/<job_id>
-  -> table-agent enqueues a comparison job and returns 202 immediately
-  -> worker submits both documents to MinerU POST /tasks concurrently
-  -> MinerU parses each document on CUDA
-  -> table-agent extracts table HTML, page geometry, and table bboxes from MinerU output
-  -> deterministic comparator compares parsed cells by refs like C3 and D4
-  -> redline renderer draws boxes on document B and writes /data/table-compare/results/<job_id>/redline.pdf
-  -> agent/client polls /v1/table-comparisons/<job_id>/result
+```mermaid
+flowchart TD
+  A[Client or agent<br/>POST /v1/table-comparisons] --> B[src/table-compare/server.ts<br/>validate multipart fields<br/>return job URLs]
+  B --> C[src/table-compare/job-manager.ts<br/>save uploads under /data/table-compare/input/job_id<br/>enqueue background work]
+  C --> D[src/table-compare/workflow.ts<br/>load tableCompareAgent from Mastra<br/>call agent.generate]
+  D --> E[src/mastra/index.ts<br/>Mastra registry]
+  E --> F[src/mastra/agents/table-compare-agent.ts<br/>agent instructions and tool registration]
+  F --> G[src/mastra/tools/table-compare-tools.ts<br/>compare-two-tables-skill tool]
+  G --> H[src/mastra/tools/mineru-table-tools.ts<br/>parse both documents with MinerU]
+  H --> I[src/table-compare/mineru-client.ts<br/>POST /tasks and poll MinerU]
+  I --> J[mineru container<br/>CUDA/VLM/OCR/table parsing]
+  H --> K[src/table-compare/table-extractor.ts<br/>content_list table HTML<br/>middle_json page/table boxes]
+  K --> L[src/table-compare/table-geometry.ts<br/>Poppler render<br/>PDF ruling-line cell boxes]
+  G --> M[src/table-compare/table-compare.ts<br/>compare cells by refs]
+  G --> N[src/table-compare/redline.ts<br/>draw red boxes on document B]
+  N --> O[/data/table-compare/results/job_id/redline.pdf]
+  G --> P[different, explanation, differences,<br/>redlinePdfPath, agent metadata]
+  P --> Q[src/table-compare/server.ts<br/>GET /result and /redline.pdf]
 ```
 
-The Mastra agent definitions live under `src/mastra`, and the deterministic API/runtime lives under `src/table-compare`.
+The async API now calls the Mastra agent for every comparison job. `src/table-compare/workflow.ts` is the API-to-agent bridge: it retrieves `tableCompareAgent` from `src/mastra/index.ts`, calls `agent.generate(...)`, restricts the active tools to `compareTwoTablesSkillTool`, and extracts the tool result from Mastra's tool-result payload. If the agent does not execute the skill tool, the job fails instead of silently falling back to a direct comparison path.
+
+The deterministic pieces still exist, but they are behind Mastra tools. The full compare skill lives in `src/mastra/tools/table-compare-tools.ts` alongside the lower-level parsed-table comparison tool. There is no separate `agent-runner.ts` or `compare-two-tables-skill-tool.ts`; those responsibilities are folded into `workflow.ts` and `table-compare-tools.ts`.
 
 ### Why The Agent Uses Tools
 
@@ -292,6 +301,7 @@ The agent is not asked to visually guess table differences. Its tools force the 
 - `parse-document-tables-with-mineru`: calls the local MinerU API and extracts structured tables.
 - `compare-mineru-parsed-tables`: compares normalized parsed cell text.
 - `create-table-redline-pdf`: renders a visual PDF redline from MinerU-derived coordinates.
+- `compare-two-tables-skill`: the API-facing Mastra tool that orchestrates parsing both documents, comparing the first parsed table, and writing the redline PDF.
 
 This keeps the judgement grounded in MinerU's parsed output rather than native multimodal inspection. The LLM-facing Mastra agent can explain or orchestrate, but the actual pass/fail comparison is deterministic code.
 
@@ -317,6 +327,11 @@ That means regular tables still work, and bordered irregular tables with uneven 
 Run it with Docker:
 
 ```bash
+set -a
+source ~/.zshrc
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}"
+export MASTRA_MODEL="${MASTRA_MODEL:-anthropic/deepseek-v4-flash}"
+set +a
 docker compose up --build mineru table-agent
 ```
 
@@ -395,6 +410,22 @@ docker run --rm -v "$PWD:/work" minidocks/poppler \
 ```
 
 See `docs/TABLE_COMPARE_AGENT.md` for the full file map and fixture workflow.
+
+### Example Run Bundle
+
+Generate five illustrative table-comparison runs, including vector PDFs, PNG table images, scanned/image-only PDFs, irregular row/column geometry, wide notes columns, and an 8x8 table:
+
+```bash
+set -a
+source ~/.zshrc
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}"
+export MASTRA_MODEL="${MASTRA_MODEL:-anthropic/deepseek-v4-flash}"
+set +a
+docker compose --profile fixtures up -d gotenberg mineru table-agent
+npm run create:table-examples
+```
+
+The script writes `data/table-example-runs/<example>/input/` with `base.pdf`/`changed.pdf` or `base.png`/`changed.png`, and `data/table-example-runs/<example>/output/` with `result.json` and `redline.pdf`. Each `result.json` includes the boolean judgement as `changed`, the agent text as `agentReasoningText`, the full comparison result, and the agent metadata.
 
 ### Node Dependencies
 

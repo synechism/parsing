@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
@@ -61,14 +61,28 @@ export async function createRedlinePdf(
 }
 
 async function loadOrCreatePdf(documentPath: string, comparison: TableComparisonResult): Promise<PDFDocument> {
-  if (documentPath.toLowerCase().endsWith(".pdf")) {
-    const bytes = await import("node:fs/promises").then((fs) => fs.readFile(documentPath));
+  const extension = path.extname(documentPath).toLowerCase();
+  if (extension === ".pdf") {
+    const bytes = await readFile(documentPath);
     return PDFDocument.load(bytes);
   }
 
   const pdf = await PDFDocument.create();
-  const pageSize = comparison.tableB.pageSize ?? [612, 792];
-  pdf.addPage(pageSize);
+  const bytes = await readFile(documentPath);
+  if (extension === ".png") {
+    const image = await pdf.embedPng(bytes);
+    const page = pdf.addPage([image.width, image.height]);
+    page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+    return pdf;
+  }
+  if (extension === ".jpg" || extension === ".jpeg") {
+    const image = await pdf.embedJpg(bytes);
+    const page = pdf.addPage([image.width, image.height]);
+    page.drawImage(image, { x: 0, y: 0, width: image.width, height: image.height });
+    return pdf;
+  }
+
+  pdf.addPage(comparison.tableB.pageSize ?? [612, 792]);
   return pdf;
 }
 

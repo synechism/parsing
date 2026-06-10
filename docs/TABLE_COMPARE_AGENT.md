@@ -8,15 +8,18 @@ Request flow:
 
 1. `POST /v1/table-comparisons` accepts `documentA` and `documentB` as multipart uploads.
 2. The async API stores both inputs under `data/table-compare/input/<job_id>/`.
-3. A background worker submits both documents to MinerU concurrently.
-4. MinerU parses each document on the GPU and returns structured output.
-5. The table extractor reads MinerU `content_list` and `middle_json`:
+3. A background worker calls `src/table-compare/workflow.ts`.
+4. `workflow.ts` retrieves `tableCompareAgent` from the Mastra registry and calls `agent.generate(...)`.
+5. The agent invokes `compare-two-tables-skill` from `src/mastra/tools/table-compare-tools.ts`.
+6. The skill tool submits both documents to MinerU concurrently.
+7. MinerU parses each document on the GPU and returns structured output.
+8. The table extractor reads MinerU `content_list` and `middle_json`:
    - table HTML from `table_body`
    - precise page-space table body bounding boxes from `middle_json` table spans
    - page geometry from `middle_json.pdf_info[].page_size`
-6. For PDF inputs, the geometry refiner renders the page and detects actual table ruling lines inside the MinerU table bbox.
-7. The comparator normalizes table HTML into a cell grid and compares cells by spreadsheet-style refs such as `C3`.
-8. The redline renderer draws red boxes on top of document B and writes `redline.pdf`.
+9. For PDF inputs, the geometry refiner renders the page and detects actual table ruling lines inside the MinerU table bbox.
+10. The comparator normalizes table HTML into a cell grid and compares cells by spreadsheet-style refs such as `C3`.
+11. The redline renderer draws red boxes on top of document B and writes `redline.pdf`.
 
 The API does not wait for parsing to finish. It returns a job id immediately and exposes polling endpoints, matching the async pattern used by the existing Python parse API.
 
@@ -39,8 +42,10 @@ In the current observed MinerU output, precise table-body boxes are available in
 - `src/table-compare/table-geometry.ts`: renders PDF pages with Poppler and detects actual table ruling lines for non-uniform cell bboxes.
 - `src/table-compare/table-compare.ts`: deterministic cell-by-cell comparison logic.
 - `src/table-compare/redline.ts`: PDF overlay rendering with `pdf-lib`.
-- `src/table-compare/workflow.ts`: orchestration used by the API.
-- `src/mastra/tools/*.ts`: Mastra tools wrapping parsing, comparison, and redline creation.
+- `src/table-compare/workflow.ts`: API-to-agent bridge; calls `tableCompareAgent.generate(...)` and extracts the Mastra tool result.
+- `src/mastra/tools/mineru-table-tools.ts`: MinerU parsing tool and shared parsing helper.
+- `src/mastra/tools/table-compare-tools.ts`: parsed-table comparison tool plus the API-facing `compare-two-tables-skill` tool.
+- `src/mastra/tools/redline-pdf-tool.ts`: redline PDF tool for direct agent use.
 - `src/mastra/agents/table-compare-agent.ts`: Mastra agent definition and instructions.
 - `src/mastra/skills/compare-two-tables.md`: operational skill instructions for the compare workflow.
 - `scripts/generate_table_fixtures.ts`: deterministic table fixture PDF generation through Gotenberg.
@@ -69,11 +74,38 @@ Download redline:
 curl -o redline.pdf http://127.0.0.1:8090/v1/table-comparisons/<job_id>/redline.pdf
 ```
 
+## Example Run Bundle
+
+Create five illustrative examples:
+
+```bash
+set -a
+source ~/.zshrc
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}"
+export MASTRA_MODEL="${MASTRA_MODEL:-anthropic/deepseek-v4-flash}"
+set +a
+docker compose --profile fixtures up -d gotenberg mineru table-agent
+npm run create:table-examples
+```
+
+The generated `data/table-example-runs/` directory contains one folder per run. Each run has:
+
+- `input/base.pdf` and `input/changed.pdf`, or `input/base.png` and `input/changed.png`;
+- `output/result.json` with `changed`, `agentReasoningText`, the full comparison result, and agent metadata;
+- `output/redline.pdf`.
+
+The examples include vector PDFs, PNG inputs parsed by MinerU, scanned/image-only PDFs, irregular row and column sizing, wide notes columns, and an 8x8 table.
+
 ## Docker
 
 Start the MinerU stack plus the table comparison API:
 
 ```bash
+set -a
+source ~/.zshrc
+export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}"
+export MASTRA_MODEL="${MASTRA_MODEL:-anthropic/deepseek-v4-flash}"
+set +a
 docker compose up --build mineru table-agent
 ```
 
@@ -103,4 +135,4 @@ unless a router or backpressure layer is added. The Docker default is `TABLE_COM
 
 - The current redline is most precise for PDF inputs because it can draw directly on document B. DOC/DOCX and image inputs are parsed by MinerU, but this first pass creates a PDF output page rather than rendering the original non-PDF document behind the overlay.
 - Cell boxes are derived from MinerU table boxes until real cell-level boxes are available.
-- The Mastra agent requires a configured model provider key to run through Mastra Studio. The async API path is deterministic and does not require an LLM key.
+- The async API path now invokes the Mastra agent, so `table-agent` needs a configured model provider key. The Docker startup maps `ANTHROPIC_AUTH_TOKEN` to `ANTHROPIC_API_KEY` when needed.

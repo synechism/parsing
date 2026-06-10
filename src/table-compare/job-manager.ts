@@ -5,13 +5,11 @@ import path from "node:path";
 import type { Express } from "express";
 
 import { compareTwoDocuments } from "./workflow";
-import type { MinerUClient } from "./mineru-client";
 import type { CompareJobRecord } from "./types";
 
 export interface JobManagerConfig {
   storageRoot: string;
   concurrency: number;
-  mineru: MinerUClient;
 }
 
 interface QueuedJob {
@@ -100,7 +98,6 @@ export class TableCompareJobManager {
         documentAPath: record.inputPaths.documentA,
         documentBPath: record.inputPaths.documentB,
         outputDirectory,
-        mineru: this.config.mineru,
       });
       record.status = "completed";
     } catch (error) {

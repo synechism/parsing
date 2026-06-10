@@ -13,4 +13,4 @@ COPY src ./src
 
 EXPOSE 8090
 
-CMD ["npm", "run", "dev:table-agent"]
+CMD ["sh", "-c", "export ANTHROPIC_API_KEY=\"${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}\"; npm run dev:table-agent"]

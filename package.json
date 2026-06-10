@@ -15,7 +15,8 @@
     "test": "npm run typecheck && npm run test:table-unit",
     "test:table-unit": "tsx scripts/test_table_compare_unit.ts",
     "test:table-e2e": "tsx scripts/test_table_compare_e2e.ts",
-    "generate:table-fixtures": "tsx scripts/generate_table_fixtures.ts"
+    "generate:table-fixtures": "tsx scripts/generate_table_fixtures.ts",
+    "create:table-examples": "tsx scripts/create_table_example_runs.ts"
   },
   "repository": {
     "type": "git",

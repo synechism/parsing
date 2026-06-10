@@ -78,6 +78,14 @@ export interface TableComparisonResult {
   tableA: ExtractedTable;
   tableB: ExtractedTable;
   redlinePdfPath?: string;
+  agent?: {
+    id: string;
+    registryName: string;
+    skill: string;
+    toolCalls: string[];
+    invokedByApi?: boolean;
+    responseText?: string;
+  };
 }
 
 export interface CompareJobRecord {

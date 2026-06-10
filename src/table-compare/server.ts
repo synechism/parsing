@@ -14,7 +14,7 @@ const mineru = new MinerUClient({
   baseUrl: mineruBaseUrl,
   resultTimeoutMs: Number(process.env.JOB_RESULT_TIMEOUT_SECONDS ?? 7200) * 1000,
 });
-const jobs = new TableCompareJobManager({ storageRoot, concurrency, mineru });
+const jobs = new TableCompareJobManager({ storageRoot, concurrency });
 const app = express();
 
 app.get("/health", async (_request, response) => {

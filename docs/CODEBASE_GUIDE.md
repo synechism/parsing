@@ -2,7 +2,7 @@
 
 This repo is a Dockerized async document parsing platform for agents. The base API does not implement PDF parsing itself. It wraps MinerU's GPU-backed API with a smaller agent-facing API that provides upload persistence, stable job ids, queueing, polling, and reproducible end-to-end tests.
 
-It also contains a first-pass Mastra table comparison agent. That service parses two documents through MinerU, compares the first extracted table cell-by-cell, and emits a redlined PDF showing changed cells.
+It also contains a first-pass Mastra table comparison agent. That service exposes an async API, invokes the Mastra agent for each comparison job, parses two documents through MinerU tools, compares the first extracted table cell-by-cell, and emits a redlined PDF showing changed cells.
 
 ## Runtime Shape
 
@@ -230,7 +230,7 @@ Responsibilities:
 - exposes `GET /v1/table-comparisons/:jobId`;
 - exposes `GET /v1/table-comparisons/:jobId/result`;
 - exposes `GET /v1/table-comparisons/:jobId/redline.pdf`;
-- wires `MinerUClient` and `TableCompareJobManager`.
+- wires `MinerUClient` for health checks and `TableCompareJobManager` for async work.
 
 ### `src/table-compare/job-manager.ts`
 
@@ -240,7 +240,7 @@ Responsibilities:
 
 - stores uploaded `documentA` and `documentB`;
 - limits concurrent comparison jobs with `TABLE_COMPARE_WORKER_CONCURRENCY`;
-- runs the compare workflow in the background;
+- runs the API-to-agent compare workflow in the background;
 - records status, errors, and final result paths.
 
 ### `src/table-compare/mineru-client.ts`
@@ -302,26 +302,45 @@ Responsibilities:
 
 ### `src/table-compare/workflow.ts`
 
-End-to-end orchestration used by the API.
+API-to-agent bridge used by the table comparison API.
 
 Responsibilities:
 
-- parses both documents through MinerU concurrently;
-- extracts tables;
-- compares the first table in each document;
-- renders the redline PDF.
+- retrieves `tableCompareAgent` from `src/mastra/index.ts`;
+- calls `agent.generate(...)` for each queued comparison job;
+- restricts active tools to `compareTwoTablesSkillTool`;
+- extracts the `compare-two-tables-skill` result from Mastra's tool-result payload;
+- marks returned results with `agent.invokedByApi=true`;
+- fails the job if the agent does not execute the skill tool.
 
 ### `src/table-compare/types.ts`
 
 Shared TypeScript domain types for tables, cells, bboxes, jobs, and comparison results.
 
-### `src/mastra/tools/*.ts`
+### `src/mastra/tools/mineru-table-tools.ts`
 
-Mastra tools wrapping:
+Mastra parsing tool and shared parsing helper.
 
-- MinerU document table parsing;
-- deterministic parsed-table comparison;
-- redline PDF creation.
+Responsibilities:
+
+- calls MinerU's local `/tasks` API through the Node client;
+- extracts structured tables from MinerU output;
+- refines PDF cell geometry with detected ruling lines.
+
+### `src/mastra/tools/table-compare-tools.ts`
+
+Mastra table comparison tools.
+
+Responsibilities:
+
+- exposes `compare-mineru-parsed-tables` for direct comparison of two parsed table structures;
+- exposes `compare-two-tables-skill`, the API-facing skill tool;
+- in the skill tool, parses both documents, compares the first parsed table, writes the redline PDF, and returns `different`, `explanation`, `differences`, `redlinePdfPath`, and agent metadata;
+- uses `toModelOutput` to give the model a compact summary while preserving the full raw tool result for the API.
+
+### `src/mastra/tools/redline-pdf-tool.ts`
+
+Mastra tool that writes a redline PDF from a comparison result and document B path.
 
 ### `src/mastra/agents/table-compare-agent.ts`
 

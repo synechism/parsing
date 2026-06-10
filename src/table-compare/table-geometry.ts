@@ -31,7 +31,8 @@ export async function refineDocumentTablesWithPdfRulingLines(
   parsed: ParsedDocumentTables,
   workDir?: string,
 ): Promise<ParsedDocumentTables> {
-  if (!documentPath.toLowerCase().endsWith(".pdf") || parsed.tables.length === 0) {
+  const sourceKind = sourceDocumentKind(documentPath);
+  if (!sourceKind || parsed.tables.length === 0) {
     return parsed;
   }
 
@@ -43,23 +44,38 @@ export async function refineDocumentTablesWithPdfRulingLines(
     await mkdir(tempRoot, { recursive: true });
     const tables: ExtractedTable[] = [];
     for (const table of parsed.tables) {
-      const page = parsed.pages.find((candidate) => candidate.pageIndex === table.pageIndex);
+      let rendered = renderedPages.get(table.pageIndex);
+      if (!rendered) {
+        rendered =
+          sourceKind === "pdf"
+            ? await renderPdfPage(documentPath, table.pageIndex, tempRoot)
+            : await loadPngPage(documentPath);
+        renderedPages.set(table.pageIndex, rendered);
+      }
+
+      const page =
+        parsed.pages.find((candidate) => candidate.pageIndex === table.pageIndex) ??
+        (sourceKind === "png"
+          ? { pageIndex: table.pageIndex, width: rendered.png.width, height: rendered.png.height }
+          : undefined);
       if (!page) {
         tables.push(table);
         continue;
       }
 
-      let rendered = renderedPages.get(table.pageIndex);
-      if (!rendered) {
-        rendered = await renderPdfPage(documentPath, table.pageIndex, tempRoot);
-        renderedPages.set(table.pageIndex, rendered);
-      }
-
+      const tableWithPageSize: ExtractedTable = table.pageSize ? table : { ...table, pageSize: [page.width, page.height] };
       const grid = detectGrid(rendered.png, [page.width, page.height], table.bbox, table.rowCount, table.colCount);
-      tables.push(grid ? applyDetectedGrid(table, grid) : table);
+      tables.push(grid ? applyDetectedGrid(tableWithPageSize, grid) : tableWithPageSize);
     }
 
-    return { ...parsed, tables };
+    return {
+      ...parsed,
+      pages:
+        parsed.pages.length > 0 || sourceKind !== "png"
+          ? parsed.pages
+          : [{ pageIndex: 0, width: renderedPages.get(0)?.png.width ?? 0, height: renderedPages.get(0)?.png.height ?? 0 }],
+      tables,
+    };
   } catch {
     return parsed;
   } finally {
@@ -67,6 +83,17 @@ export async function refineDocumentTablesWithPdfRulingLines(
       await rm(tempRoot, { recursive: true, force: true });
     }
   }
+}
+
+function sourceDocumentKind(documentPath: string): "pdf" | "png" | null {
+  const extension = path.extname(documentPath).toLowerCase();
+  if (extension === ".pdf") {
+    return "pdf";
+  }
+  if (extension === ".png") {
+    return "png";
+  }
+  return null;
 }
 
 async function renderPdfPage(documentPath: string, pageIndex: number, outputDir: string): Promise<RenderedPage> {
@@ -86,6 +113,10 @@ async function renderPdfPage(documentPath: string, pageIndex: number, outputDir:
 
   const png = PNG.sync.read(await readFile(`${prefix}.png`));
   return { pageIndex, png };
+}
+
+async function loadPngPage(documentPath: string): Promise<RenderedPage> {
+  return { pageIndex: 0, png: PNG.sync.read(await readFile(documentPath)) };
 }
 
 function detectGrid(
