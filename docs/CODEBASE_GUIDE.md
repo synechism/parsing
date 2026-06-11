@@ -1,704 +1,1058 @@
-# Codebase Guide
+# Codebase Guide: MinerU Table Comparison Agent
 
-This repo is a Dockerized async document parsing platform for agents. The base API does not implement PDF parsing itself. It wraps MinerU's GPU-backed API with a smaller agent-facing API that provides upload persistence, stable job ids, queueing, polling, and reproducible end-to-end tests.
+This document describes the table comparison system as it stands now. It follows one full request from the HTTP API, through the async job queue, into the Mastra semantic agent, through MinerU parsing, semantic comparison, and redline PDF generation.
 
-It also contains a first-pass Mastra table comparison agent. That service exposes an async API, invokes the Mastra agent for each comparison job, parses two documents through MinerU tools, compares the first extracted table cell-by-cell, and emits a redlined PDF showing changed cells.
+The older outer `tableCompareAgent` path has been removed. The API now talks directly to `semanticTableCompareAgent`.
 
-## Runtime Shape
+## High-Level Shape
 
-```text
-client / agent
-  -> POST /v1/parse on api container
-  -> api saves uploaded PDFs to ./data/input/<job_id>/
-  -> api enqueues a JobRecord
-  -> api worker submits the files to mineru POST /tasks
-  -> mineru parses with CUDA/VLM/OCR/table/image models
-  -> api polls mineru GET /tasks/<mineru_task_id>
-  -> api saves normalized output to ./data/results/<job_id>/result.json
-  -> client polls /v1/jobs/<job_id> and /v1/jobs/<job_id>/result
+```mermaid
+flowchart TD
+  A[Client POST /v1/table-comparisons] --> B[src/table-compare/server.ts]
+  B --> C[TableCompareJobManager.submit]
+  C --> D[queued job + saved input files]
+  D --> E[TableCompareJobManager.run]
+  E --> F[src/table-compare/workflow.ts compareTwoDocuments]
+  F --> G[Mastra registry: semanticTableCompareAgent]
+  G --> H[parse-document-pair-tables-with-mineru tool]
+  H --> I[MinerUClient POST /tasks + poll /result]
+  I --> J[table-extractor: MinerU JSON to ExtractedTable]
+  J --> K[table-geometry: ruling-line cell boxes]
+  K --> L[semantic comparison prompt]
+  L --> M[semanticTableCompareAgent JSON plan]
+  M --> N[semantic-compare: validate plan + map refs to bboxes]
+  N --> O[redline.ts create redline.pdf]
+  O --> P[GET /result and GET /redline.pdf]
 ```
 
-There are two services:
-
-- `api`: the code in this repo. It is the public agent-facing API.
-- `mineru`: an external MinerU image. It owns CUDA, model loading, and actual parsing.
-- `table-agent`: Node/Mastra table comparison API on port `8090`.
-- `gotenberg`: optional fixture-only HTML-to-PDF service behind the `fixtures` Compose profile.
-
-## Source Files
-
-### `src/pdfparse_agent/main.py`
-
-FastAPI application entrypoint.
-
-Responsibilities:
-
-- creates the FastAPI app;
-- initializes `Settings`, `Storage`, `MinerUClient`, and `JobManager` during lifespan startup;
-- checks MinerU health on startup by default;
-- exposes `GET /health`;
-- exposes `POST /v1/parse`;
-- exposes `GET /v1/jobs/{job_id}`;
-- exposes `GET /v1/jobs/{job_id}/result`;
-- translates internal `JobRecord` objects into API responses.
-
-Main behavior:
-
-- `POST /v1/parse` accepts multipart PDF uploads and form options.
-- It saves files locally before queuing the parse job.
-- It returns `202 Accepted` immediately with a stable platform `job_id`.
-- It does not block on MinerU parsing.
-
-Change this file when:
-
-- adding/removing HTTP endpoints;
-- changing form parameters;
-- changing response shapes;
-- adding auth, API keys, callbacks, or request validation.
-
-### `src/pdfparse_agent/config.py`
-
-Environment-driven settings.
-
-Responsibilities:
-
-- defines all runtime config with `pydantic-settings`;
-- reads values from environment variables and `.env`;
-- provides computed storage paths under `STORAGE_ROOT`;
-- memoizes settings through `get_settings()`.
-
-Important settings:
-
-- `MINERU_BASE_URL`: where the wrapper calls MinerU, default `http://mineru:8000`.
-- `STORAGE_ROOT`: root for uploads/results/temp files, default `/data`.
-- `WORKER_CONCURRENCY`: number of platform worker tasks, validated default is `4`.
-- `DEFAULT_BACKEND`: MinerU backend, default `hybrid-auto-engine`.
-- `DEFAULT_PARSE_METHOD`: default parse method, default `auto`.
-- `MAX_UPLOAD_BYTES`: per-upload size limit.
-- `REQUIRE_MINERU_HEALTH_ON_STARTUP`: fail API startup if MinerU is unhealthy.
-
-Change this file when:
-
-- adding an environment variable;
-- changing defaults;
-- adding path conventions.
-
-### `src/pdfparse_agent/models.py`
-
-Pydantic/domain models shared across API, storage, and worker code.
-
-Responsibilities:
-
-- defines `JobStatus`;
-- defines terminal status constants;
-- defines parse options sent to MinerU;
-- defines the internal `JobRecord`;
-- defines public response models.
-
-Key models:
-
-- `ParseOptions`: form/API options for MinerU parsing, such as backend, language, table parsing, image analysis, and output format flags.
-- `JobRecord`: internal state for one parse job, including local file paths, MinerU task id, status timestamps, errors, and final result.
-- `SubmitResponse`: response for `POST /v1/parse`.
-- `JobStatusResponse`: response for `GET /v1/jobs/{job_id}`.
-
-Change this file when:
-
-- adding job metadata;
-- adding parse options;
-- changing status semantics;
-- changing public response schemas.
-
-### `src/pdfparse_agent/storage.py`
-
-Filesystem persistence helper.
-
-Responsibilities:
-
-- creates storage directories;
-- sanitizes uploaded filenames;
-- writes uploaded files to `./data/input/<job_id>/`;
-- enforces `MAX_UPLOAD_BYTES`;
-- writes final normalized JSON to `./data/results/<job_id>/result.json`;
-- can clean up a job's input/result directories.
-
-Important functions/classes:
-
-- `safe_filename()`: strips unsafe path/name characters from upload names.
-- `Storage.save_upload_stream()`: streams upload content to disk with a size limit.
-- `Storage.write_result()`: writes a completed job result as JSON.
-- `Storage.cleanup_job()`: removes persisted files for a job.
-
-Change this file when:
-
-- moving from local disk to S3/object storage;
-- changing result layout;
-- adding retention or cleanup policy;
-- changing upload validation.
-
-### `src/pdfparse_agent/mineru_client.py`
-
-Async HTTP client for MinerU.
-
-Responsibilities:
-
-- owns an `httpx.AsyncClient`;
-- checks MinerU `/health`;
-- submits files to MinerU `/tasks`;
-- polls MinerU task status;
-- fetches final MinerU result.
-
-Important methods:
-
-- `health()`: validates the MinerU service is reachable and healthy.
-- `submit_task(paths, options)`: sends multipart files and parse options to MinerU.
-- `wait_for_result(task_id)`: polls until MinerU returns completed, failed, or timeout.
-
-Notable behavior:
-
-- The client sends form fields using MinerU's expected names.
-- It uses `lang_list` even though the platform exposes a simpler single `lang` value.
-- It returns MinerU's JSON response directly; normalization happens by storing that response as the platform result.
-
-Change this file when:
-
-- MinerU's API changes;
-- adding retries/backoff;
-- supporting ZIP responses;
-- routing to multiple MinerU backends;
-- adding request tracing or structured logs.
-
-### `src/pdfparse_agent/worker.py`
-
-In-process async job queue and worker manager.
-
-Responsibilities:
-
-- stores all active/in-memory `JobRecord` objects;
-- owns an `asyncio.Queue`;
-- starts N worker tasks based on `WORKER_CONCURRENCY`;
-- submits jobs to MinerU through `MinerUClient`;
-- updates job status/timestamps/errors;
-- persists final results through `Storage`.
-
-Important classes:
-
-- `JobManager`: queue, job registry, worker lifecycle, and job execution.
-
-Important methods:
-
-- `start()`: creates worker tasks.
-- `stop()`: cancels worker tasks during app shutdown.
-- `submit(job)`: registers and enqueues a job.
-- `_process(job)`: performs the actual MinerU submit, poll, result persistence, and failure handling.
-
-Current limitations:
-
-- Job state is in memory. Persisted result JSON survives restarts, but the in-memory job registry does not.
-- Queue state is in memory. For a production multi-instance API, use Redis/Postgres/SQS or another external queue.
-
-Change this file when:
-
-- adding durable queueing;
-- adding retry policies;
-- adding priority scheduling;
-- adding cancellation;
-- routing jobs across multiple MinerU services.
-
-### `src/pdfparse_agent/__init__.py`
-
-Package metadata.
-
-Responsibilities:
-
-- defines `__version__`.
-
-Change this file when:
-
-- bumping package version metadata.
-
-## Mastra Table Comparison Files
-
-### `src/table-compare/server.ts`
-
-Express entrypoint for the async table comparison API.
-
-Responsibilities:
-
-- exposes `GET /health`;
-- exposes `POST /v1/table-comparisons`;
-- exposes `GET /v1/table-comparisons/:jobId`;
-- exposes `GET /v1/table-comparisons/:jobId/result`;
-- exposes `GET /v1/table-comparisons/:jobId/redline.pdf`;
-- wires `MinerUClient` for health checks and `TableCompareJobManager` for async work.
-
-### `src/table-compare/job-manager.ts`
-
-In-memory queue for table comparison jobs.
-
-Responsibilities:
-
-- stores uploaded `documentA` and `documentB`;
-- limits concurrent comparison jobs with `TABLE_COMPARE_WORKER_CONCURRENCY`;
-- runs the API-to-agent compare workflow in the background;
-- records status, errors, and final result paths.
-
-### `src/table-compare/mineru-client.ts`
-
-Node client for MinerU's local `/tasks` API.
-
-Responsibilities:
-
-- sends one document as multipart form data;
-- requests `content_list` and `middle_json`;
-- polls task status;
-- returns the final MinerU JSON result.
-
-### `src/table-compare/table-extractor.ts`
-
-Converts MinerU output into comparable table structures.
-
-Responsibilities:
-
-- reads `content_list` table HTML and table bboxes;
-- reads page sizes from `middle_json.pdf_info`;
-- parses table HTML with `cheerio`;
-- normalizes cell text;
-- assigns spreadsheet-style cell refs;
-- creates initial per-cell bboxes inside the MinerU table bbox.
-
-### `src/table-compare/table-geometry.ts`
-
-Refines table/cell geometry for PDF inputs.
-
-Responsibilities:
-
-- renders PDF pages with `pdftoppm`;
-- reads rendered PNGs with `pngjs`;
-- detects horizontal and vertical ruling-line clusters inside MinerU's table-body bbox;
-- replaces uniform cell boxes with non-uniform boxes from the detected grid;
-- falls back to the extractor's uniform boxes when the detector cannot find the expected boundaries.
-
-### `src/table-compare/table-compare.ts`
-
-Deterministic table diff engine.
-
-Responsibilities:
-
-- compares parsed cells by ref;
-- detects changed, added, removed, and shape-changed cells;
-- returns a boolean judgement and human-readable summary.
-
-### `src/table-compare/redline.ts`
-
-PDF visual redline renderer.
-
-Responsibilities:
-
-- opens document B when it is a PDF;
-- maps MinerU top-left page coordinates into PDF bottom-left coordinates;
-- draws red overlays around changed cells;
-- writes `redline.pdf`.
-
-### `src/table-compare/workflow.ts`
-
-API-to-agent bridge used by the table comparison API.
-
-Responsibilities:
-
-- retrieves `tableCompareAgent` from `src/mastra/index.ts`;
-- calls `agent.generate(...)` for each queued comparison job;
-- restricts active tools to `compareTwoTablesSkillTool`;
-- extracts the `compare-two-tables-skill` result from Mastra's tool-result payload;
-- marks returned results with `agent.invokedByApi=true`;
-- fails the job if the agent does not execute the skill tool.
-
-### `src/table-compare/types.ts`
-
-Shared TypeScript domain types for tables, cells, bboxes, jobs, and comparison results.
-
-### `src/mastra/tools/mineru-table-tools.ts`
-
-Mastra parsing tool and shared parsing helper.
-
-Responsibilities:
-
-- calls MinerU's local `/tasks` API through the Node client;
-- extracts structured tables from MinerU output;
-- refines PDF cell geometry with detected ruling lines.
-
-### `src/mastra/tools/table-compare-tools.ts`
-
-Mastra table comparison tools.
-
-Responsibilities:
-
-- exposes `compare-mineru-parsed-tables` for direct comparison of two parsed table structures;
-- exposes `compare-two-tables-skill`, the API-facing skill tool;
-- in the skill tool, parses both documents, compares the first parsed table, writes the redline PDF, and returns `different`, `explanation`, `differences`, `redlinePdfPath`, and agent metadata;
-- uses `toModelOutput` to give the model a compact summary while preserving the full raw tool result for the API.
-
-### `src/mastra/tools/redline-pdf-tool.ts`
-
-Mastra tool that writes a redline PDF from a comparison result and document B path.
-
-### `src/mastra/agents/table-compare-agent.ts`
-
-Mastra agent definition.
-
-The instructions force the agent to ground judgement in MinerU structured output instead of relying only on native multimodal inspection.
-
-### `src/mastra/skills/compare-two-tables.md`
-
-Skill instructions for the table comparison workflow.
-
-### `src/mastra/index.ts`
-
-Mastra runtime entrypoint registering `tableCompareAgent`.
-
-## Docker and Deployment Files
+## Runtime Services
 
 ### `docker-compose.yml`
 
-Primary local deployment.
+The table comparison path runs mainly through two services:
 
-Services:
+- `mineru`: GPU-backed MinerU API container.
+- `table-agent`: Node/Mastra async API for table comparison.
 
-- `mineru`: GPU-backed MinerU API service.
-- `api`: this repo's FastAPI wrapper.
-- `table-agent`: Node async table comparison API.
-- `gotenberg`: optional fixture PDF generator under the `fixtures` profile.
+Important `mineru` settings:
 
-Important defaults:
+- `gpus: all`
+- `MINERU_DEVICE_MODE=cuda`
+- `MINERU_API_MAX_CONCURRENT_REQUESTS`
+- `MINERU_PROCESSING_WINDOW_SIZE`
 
-- `MINERU_IMAGE=${MINERU_IMAGE:-mineru-api:latest}`: uses the already-present MinerU image by default.
-- `gpus: all`: exposes GPU devices to MinerU.
-- `MINERU_DEVICE_MODE=cuda`: forces MinerU device selection to CUDA.
-- `GPU_MEMORY_UTILIZATION=0.9`: vLLM cache reservation.
-- `MINERU_API_MAX_CONCURRENT_REQUESTS=4`: validated L40S concurrency.
-- `WORKER_CONCURRENCY=4`: platform worker concurrency.
-- `./data:/data`: persists platform uploads/results on the host.
-- `mineru-output:/data/mineru-output`: stores MinerU's own artifacts in a Docker volume.
-- `TABLE_COMPARE_WORKER_CONCURRENCY=2`: table-agent job concurrency. Each job submits two MinerU tasks.
-- `GOTENBERG_PORT=3001`: default fixture generator host port.
+Important `table-agent` settings:
 
-Change this file when:
-
-- changing production defaults;
-- exposing different ports;
-- mounting persistent storage differently;
-- adding Redis/Postgres/metrics services;
-- changing GPU allocation.
-
-### `docker-compose.build.yml`
-
-Optional Compose override for building the MinerU image from this repo's Dockerfile.
-
-Use:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
-```
-
-This is separate because MinerU's GPU image is large. On the current host, Docker storage was nearly full, so the normal path uses the existing `mineru-api:latest` image.
-
-Change this file when:
-
-- changing how the local MinerU image is built;
-- switching image tags for custom MinerU builds.
-
-### `docker/api.Dockerfile`
-
-Builds the lightweight wrapper API image.
-
-Steps:
-
-- starts from `python:3.12-slim`;
-- installs `pip` and `uv`;
-- copies `pyproject.toml`, `README.md`, and `src`;
-- installs this package into the system Python environment;
-- runs `uvicorn pdfparse_agent.main:app` on port `8080`.
-
-Change this file when:
-
-- adding system dependencies for the wrapper API;
-- changing Python version;
-- changing package install mode;
-- changing the API startup command.
+- `MINERU_BASE_URL=http://mineru:8000`
+- `TABLE_COMPARE_STORAGE_ROOT=/data`
+- `TABLE_COMPARE_WORKER_CONCURRENCY`
+- `MASTRA_MODEL`
+- `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`
 
 ### `docker/mastra-agent.Dockerfile`
 
-Builds the Node table comparison API image.
-
-Steps:
+Builds the Node service for table comparison:
 
 - starts from `node:24-slim`;
-- installs dependencies with `npm ci`;
+- installs `poppler-utils`, used by `pdftoppm` for PDF page rendering;
+- runs `npm ci`;
 - copies `src`;
-- runs `npm run dev:table-agent` on port `8090`.
+- starts `npm run dev:table-agent`, which runs `tsx src/table-compare/server.ts`.
 
-Change this file when:
+## Server Initialization
 
-- changing the Node version;
-- adding system dependencies for document conversion;
-- changing the table-agent startup command.
+### `src/table-compare/server.ts`
 
-### `docker/mineru.Dockerfile`
+This is the HTTP entrypoint for the table comparison API.
 
-Builds a full MinerU GPU image.
+At module load time it initializes:
 
-Steps:
+- `port` from `TABLE_COMPARE_PORT`, default `8090`;
+- `storageRoot` from `TABLE_COMPARE_STORAGE_ROOT` or `STORAGE_ROOT`, default `/data`;
+- `mineruBaseUrl` from `MINERU_BASE_URL`, default `http://127.0.0.1:8000`;
+- worker concurrency from `TABLE_COMPARE_WORKER_CONCURRENCY` or `WORKER_CONCURRENCY`, default `2`;
+- `multer` memory upload handling with `MAX_UPLOAD_BYTES`;
+- a `MinerUClient` for health checks;
+- a `TableCompareJobManager` for async job state and execution;
+- an Express app.
 
-- starts from `vllm/vllm-openai:v0.21.0`;
-- installs OS packages needed by OpenCV/fonts;
-- installs `mineru[core]`;
-- downloads MinerU models during build;
-- starts `mineru-api` with VLM preload enabled.
+The server starts at the bottom of the file:
 
-Current role:
-
-- buildable fallback/custom image definition;
-- not used by default unless `docker-compose.build.yml` is included.
-
-Change this file when:
-
-- pinning a different MinerU version;
-- changing model download source;
-- using a different CUDA/vLLM base image;
-- adding GPU runtime flags.
-
-### `.dockerignore`
-
-Docker build context exclusions.
-
-Responsibilities:
-
-- keeps Git metadata, Python caches, virtualenvs, and runtime `data/` out of image build contexts.
-
-Change this file when:
-
-- new generated folders should not enter Docker builds.
-
-### `.env.example`
-
-Example environment variables for Compose/runtime tuning.
-
-Important values:
-
-- `MINERU_API_MAX_CONCURRENT_REQUESTS=4`
-- `WORKER_CONCURRENCY=4`
-- `MINERU_PROCESSING_WINDOW_SIZE=64`
-- `DEFAULT_BACKEND=hybrid-auto-engine`
-- `JOB_RESULT_TIMEOUT_SECONDS=7200`
-
-Change this file when:
-
-- adding config options;
-- changing recommended defaults.
-
-## Scripts
-
-### `scripts/download_test_pdfs.py`
-
-Downloads a complex PDF test corpus to `data/test-pdfs`.
-
-Current PDFs:
-
-- Attention Is All You Need
-- LayoutParser
-- DocLayNet
-- MinerU technical report
-
-Outputs:
-
-- `data/test-pdfs/*.pdf`
-- `data/test-pdfs/manifest.json`
-
-Change this file when:
-
-- adding/removing benchmark PDFs;
-- changing corpus source URLs;
-- adding checksums.
-
-### `scripts/run_e2e.py`
-
-End-to-end benchmark/test runner.
-
-Responsibilities:
-
-- checks `/health`;
-- submits PDFs to `POST /v1/parse`;
-- polls each job until completion/failure/timeout;
-- fetches final results;
-- records simple quality signals:
-  - `has_markdown`;
-  - `has_table_signal`;
-  - `has_image_signal`;
-  - `result_bytes`;
-- writes a summary JSON file.
-
-Common use:
-
-```bash
-python3 scripts/run_e2e.py \
-  --api-url http://127.0.0.1:8080 \
-  --pdf-dir data/test-pdfs \
-  --out data/e2e-summary.json \
-  --concurrency 4
+```ts
+app.listen(port, () => {
+  console.log(`table comparison API listening on :${port}`);
+});
 ```
 
-Change this file when:
+## HTTP API
 
-- adding stronger assertions;
-- measuring elapsed time per file;
-- collecting GPU metrics;
-- turning the benchmark into a CI test.
+### `GET /health`
 
-### `scripts/generate_table_fixtures.ts`
+Defined in `server.ts`.
 
-Generates deterministic HTML and PDF table fixtures through Gotenberg.
+This calls `mineru.health()` through `MinerUClient.health()` and returns:
 
-Outputs:
+- table-agent health;
+- MinerU health/version/status;
+- job counts from `jobs.counts()`;
+- configured worker concurrency.
 
-- `data/table-fixtures/base.html`
-- `data/table-fixtures/base.pdf`
-- `data/table-fixtures/identical.pdf`
-- `data/table-fixtures/changed.pdf`
-- `data/table-fixtures/manifest.json`
+### `POST /v1/table-comparisons`
 
-The manifest records expected diffs for `base` vs `changed`.
+Defined in `server.ts`.
 
-## Project Metadata
+This is the main request entrypoint. It expects multipart fields:
 
-### `pyproject.toml`
+- `documentA`
+- `documentB`
+- optional `baselineDocument` or `baseline`, value `documentA` or `documentB`
 
-Python package metadata and dependencies.
+The route does the following:
 
-Runtime dependencies:
+1. Uses `upload.fields(...)` from `multer` to accept two uploaded files in memory.
+2. Validates both documents exist.
+3. Calls `parseBaselineDocument(...)` to validate the optional baseline.
+4. Calls `jobs.submit({ documentA, documentB, baselineDocument })`.
+5. Returns `202 Accepted` immediately with:
+   - `jobId`
+   - status URL
+   - result URL
+   - redline PDF URL
 
-- `fastapi`
-- `httpx`
-- `pydantic`
-- `pydantic-settings`
-- `python-multipart`
-- `uvicorn[standard]`
+The request does not wait for MinerU or the model.
 
-Dev dependencies:
+### `GET /v1/table-comparisons/:jobId`
 
-- `pytest`
-- `ruff`
+Defined in `server.ts`.
 
-Change this file when:
+This calls `jobs.get(jobId)` and returns serialized job state via `serializeJob(...)`.
 
-- adding Python dependencies;
-- changing package metadata;
-- adding lint/test tooling.
+### `GET /v1/table-comparisons/:jobId/result`
 
-### `package.json` and `package-lock.json`
+Defined in `server.ts`.
 
-Node package metadata for Mastra and the table comparison API.
+Behavior:
 
-Important scripts:
+- `202` if queued or processing;
+- `409` if failed;
+- full `TableComparisonResult` JSON when completed.
 
-- `npm run dev:mastra`: starts Mastra Studio/runtime.
-- `npm run build:mastra`: builds Mastra.
-- `npm run dev:table-agent`: starts the async table comparison API.
-- `npm run typecheck`: runs TypeScript checking.
-- `npm run generate:table-fixtures`: creates deterministic Gotenberg PDFs.
+### `GET /v1/table-comparisons/:jobId/redline.pdf`
 
-### `README.md`
+Defined in `server.ts`.
 
-Human runbook and architecture overview.
+Behavior:
+
+- `202` if the redline is not ready;
+- `409` if the job failed;
+- sends `job.result.redlinePdfPath` once completed.
+
+## Job Creation And Queueing
+
+### `src/table-compare/job-manager.ts`
+
+The class is `TableCompareJobManager`.
+
+It owns:
+
+- `jobs`: in-memory `Map<string, CompareJobRecord>`;
+- `queue`: pending jobs;
+- `active`: current worker count;
+- configured `concurrency`.
+
+### `TableCompareJobManager.submit(...)`
+
+Called by `server.ts` from `POST /v1/table-comparisons`.
+
+Responsibilities:
+
+1. Creates a job id using `randomUUID().replaceAll("-", "")`.
+2. Creates an input directory:
+
+   ```text
+   <storageRoot>/table-compare/input/<job_id>/
+   ```
+
+3. Sanitizes upload names with `safeName(...)`.
+4. Writes both uploaded buffers to disk.
+5. Builds a `CompareJobRecord` with:
+   - id;
+   - status `queued`;
+   - original stored filenames;
+   - absolute input paths;
+   - optional baseline document;
+   - timestamps.
+6. Stores the record in `jobs`.
+7. Pushes the record into `queue`.
+8. Calls `drain()`.
+9. Returns the job immediately to the HTTP route.
+
+### `TableCompareJobManager.drain()`
+
+Starts queued work while `active < concurrency`.
+
+For each job it:
+
+- removes one queued record;
+- increments `active`;
+- calls `run(record)` asynchronously;
+- decrements `active` when finished;
+- calls `drain()` again to continue processing the queue.
+
+### `TableCompareJobManager.run(record)`
+
+This is the background worker for one comparison.
+
+Responsibilities:
+
+1. Marks the job `processing`.
+2. Creates an output directory:
+
+   ```text
+   <storageRoot>/table-compare/results/<job_id>/
+   ```
+
+3. Calls `compareTwoDocuments(...)` from `src/table-compare/workflow.ts`.
+4. Stores the returned `TableComparisonResult` on `record.result`.
+5. Marks the job `completed`, or `failed` with an error string.
+6. Updates timestamps.
+
+## API-To-Agent Workflow
+
+### `src/table-compare/workflow.ts`
+
+This file is the bridge between the async API/job system and Mastra.
+
+The main exported function is:
+
+```ts
+compareTwoDocuments(input: CompareTwoDocumentsInput): Promise<TableComparisonResult>
+```
+
+The input contains:
+
+- `documentAPath`
+- `documentBPath`
+- `outputDirectory`
+- optional `baselineDocument`
+
+### `compareTwoDocuments(...)`
+
+This is the core orchestration function for a job.
+
+Step by step:
+
+1. Retrieves the Mastra agent:
+
+   ```ts
+   const agent = mastra.getAgent("semanticTableCompareAgent");
+   ```
+
+2. Defaults `baselineDocument` to `documentB`.
+3. Calls `parseDocumentsWithSemanticAgent(agent, input)`.
+4. Fails if either parsed document has no tables.
+5. Selects the first table from each document:
+
+   ```ts
+   const tableA = parsed.documentA.tables[0];
+   const tableB = parsed.documentB.tables[0];
+   ```
+
+6. Calls `buildSemanticComparisonPrompt(tableA, tableB, baselineDocument)`.
+7. Calls `runSemanticJudgement(agent, prompt, tableA, tableB)`.
+8. Converts the agent JSON plan into a typed `TableComparisonResult` with `buildSemanticComparisonResult(...)`.
+9. Chooses the baseline file path for redlining.
+10. Calls `createRedlinePdf(...)`.
+11. Returns the full comparison result plus agent metadata:
+
+   ```json
+   {
+     "id": "semantic-table-compare-agent",
+     "registryName": "semanticTableCompareAgent",
+     "skill": "compare-two-tables",
+     "toolCalls": [
+       "parse-document-pair-tables-with-mineru",
+       "semantic-table-compare-agent",
+       "create-table-redline-pdf"
+     ],
+     "invokedByApi": true
+   }
+   ```
+
+### `parseDocumentsWithSemanticAgent(...)`
+
+This function forces the request through the Mastra agent and the MinerU tool.
+
+It builds a prompt instructing the agent to call:
+
+```text
+parse-document-pair-tables-with-mineru
+```
+
+with exact arguments:
+
+- `documentAPath`
+- `documentBPath`
+- `documentAName`
+- `documentBName`
+- `geometryWorkDirA`
+- `geometryWorkDirB`
+
+The call to `agent.generate(...)` restricts active tools:
+
+```ts
+activeTools: ["parseDocumentPairTablesTool"]
+```
+
+This means the agent can call the pair parsing tool, but not arbitrary tools.
+
+`onStepFinish` calls `extractParsePairToolResult(step)` to capture the tool output. After generation finishes, the function checks that the extracted output has both:
+
+- `documentA`
+- `documentB`
+
+If not, the job fails with:
+
+```text
+semanticTableCompareAgent did not parse both documents with MinerU
+```
+
+Why the pair tool exists:
+
+- Earlier two independent parse calls could let the model accidentally parse the same document twice.
+- The pair tool keeps the agent in the loop while making document A/B binding deterministic.
+- Internally the pair tool still parses both documents concurrently.
+
+### `runSemanticJudgement(...)`
+
+This function asks the same semantic agent to make the final comparison decision.
+
+It calls:
+
+```ts
+agent.generate(prompt, {
+  activeTools: [],
+  modelSettings: { temperature: 0, maxOutputTokens: 4096 },
+})
+```
+
+Important detail: `activeTools: []` means the model is not allowed to call tools during the judgement phase. At this point it must reason from the structured MinerU evidence in the prompt.
+
+Then it:
+
+1. Reads `response.text`.
+2. Calls `parseSemanticPlanOrRepair(...)`.
+3. Calls `reviewSameFormatCandidates(...)`.
+4. Returns the final `SemanticComparisonPlan` and final agent response text.
+
+### `parseSemanticPlanOrRepair(...)`
+
+The semantic agent must return JSON matching `semanticComparisonPlanSchema`.
+
+This function:
+
+1. Attempts to parse the response with `parseSemanticComparisonPlanText(...)`.
+2. If parsing fails, asks the same agent to repair the JSON.
+3. Allows up to three attempts.
+4. Requires strict JSON: no comments, no trailing commas, quoted property names.
+
+### `reviewSameFormatCandidates(...)`
+
+This is a guardrail for same-format tables.
+
+If both tables have the same row count and column count, and the agent omitted some obvious positional candidate differences, the workflow sends a second review prompt built by:
+
+```ts
+buildSameFormatCandidateReviewPrompt(...)
+```
+
+This does not replace semantic reasoning with hardcoded comparison. It asks the semantic agent to explicitly review the omitted candidates and either include them or explain why they are formatting-only.
+
+## Mastra Runtime
+
+### `src/mastra/index.ts`
+
+Registers the only API-facing table comparison agent:
+
+```ts
+export const mastra = new Mastra({
+  agents: { semanticTableCompareAgent },
+});
+```
+
+There is no longer a separate outer `tableCompareAgent`.
+
+### `src/mastra/model.ts`
+
+`defaultModel()` selects the model string:
+
+1. `MASTRA_MODEL`, if provided.
+2. `anthropic/deepseek-v4-flash`, if Anthropic auth env vars exist.
+3. `openai/gpt-4o-mini` fallback.
+
+### `src/mastra/agents/semantic-table-compare-agent.ts`
+
+Defines:
+
+```ts
+semanticTableCompareAgent
+```
+
+Important properties:
+
+- `id`: `semantic-table-compare-agent`
+- `name`: `Semantic Table Compare Agent`
+- `model`: `defaultModel()`
+- `tools`: `{ parseDocumentPairTablesTool }`
+
+The instructions tell the agent:
+
+- call `parse-document-pair-tables-with-mineru` when given document paths;
+- use already parsed MinerU table evidence when provided;
+- infer row and column matches semantically;
+- handle reordered rows, different headers, extra template columns, payable/invoice comparisons, and equivalent part descriptions;
+- ignore style/order-only changes;
+- report material business-content differences.
+
+## MinerU Tool Layer
+
+### `src/mastra/tools/mineru-table-tools.ts`
+
+This file exposes the Mastra tools and shared helpers for parsing documents with MinerU.
+
+### `parseDocumentPairTablesTool`
+
+Tool id:
+
+```text
+parse-document-pair-tables-with-mineru
+```
+
+This is the tool used in the current API path.
+
+Its input schema includes:
+
+- `documentAPath`
+- `documentBPath`
+- optional `documentAName`
+- optional `documentBName`
+- optional `geometryWorkDirA`
+- optional `geometryWorkDirB`
+
+Its `execute` function calls:
+
+```ts
+parseDocumentPairTables(...)
+```
+
+### `parseDocumentPairTables(...)`
+
+This function creates one shared `MinerUClient`, then parses both documents concurrently:
+
+```ts
+const [documentA, documentB] = await Promise.all([...]);
+```
+
+Each side calls `parseDocumentTables(...)`.
+
+### `parseDocumentTables(...)`
+
+One-document parsing helper.
+
+Responsibilities:
+
+1. Uses `MinerUClient.parseDocument(filePath)`.
+2. Calls `extractTablesFromMinerUResult(...)`.
+3. Calls `refineDocumentTablesWithPdfRulingLines(...)`.
+4. Returns `ParsedDocumentTables`.
+
+### `parseDocumentTablesTool`
+
+Single-document Mastra tool:
+
+```text
+parse-document-tables-with-mineru
+```
+
+This remains available as a lower-level tool/helper, but the API comparison path uses the pair tool to avoid document mix-ups.
+
+## MinerU HTTP Client
+
+### `src/table-compare/mineru-client.ts`
+
+The class is `MinerUClient`.
+
+### `MinerUClient.parseDocument(filePath, options)`
+
+This submits one file to MinerU.
+
+It builds multipart form data with:
+
+- file bytes;
+- `lang_list`;
+- `backend`, default `hybrid-auto-engine`;
+- `parse_method`, default `auto`;
+- `formula_enable`;
+- `table_enable`;
+- `image_analysis`;
+- `return_md=true`;
+- `return_middle_json=true`;
+- `return_content_list=true`;
+- page range.
+
+Then it:
+
+1. `POST`s to `${baseUrl}/tasks`.
+2. Reads `task_id`.
+3. Calls `waitForResult(taskId)`.
+
+### `MinerUClient.waitForResult(taskId)`
+
+Polls:
+
+```text
+GET /tasks/:taskId
+```
+
+until:
+
+- `completed`: fetches `GET /tasks/:taskId/result`;
+- `failed`: throws;
+- timeout: throws.
+
+### `guessMimeType(fileName)`
+
+Supports:
+
+- PDF
+- DOC
+- DOCX
+- PNG
+- JPG/JPEG
+- WEBP
+
+This is why the API can accept PDFs, office documents, and images as inputs, assuming MinerU can parse the format.
+
+## Converting MinerU Output Into Tables
+
+### `src/table-compare/table-extractor.ts`
+
+The main exported function is:
+
+```ts
+extractTablesFromMinerUResult(rawResult, fileName, mineruTaskId)
+```
+
+It converts raw MinerU output into:
+
+```ts
+ParsedDocumentTables
+```
+
+### What It Reads From MinerU
+
+It reads the first result entry from `rawResult.results`.
+
+From `middle_json`, it extracts:
+
+- page sizes via `extractPages(...)`;
+- table body page-space bounding boxes via `extractMiddleJsonTables(...)`.
+
+From `content_list`, it extracts:
+
+- table items where `type === "table"`;
+- `table_body` HTML;
+- captions;
+- fallback table bboxes.
+
+### `buildExtractedTable(...)`
+
+This function creates an `ExtractedTable`:
+
+- table index;
+- page index;
+- page size;
+- table bbox;
+- raw table HTML;
+- row count;
+- column count;
+- cells.
+
+Cells are parsed from HTML by `parseTableHtml(...)`.
+
+### `parseTableHtml(...)`
+
+Uses `cheerio` to walk table rows and `th`/`td` cells.
+
+It captures:
+
+- row index;
+- column index;
+- `rowspan`;
+- `colspan`;
+- normalized text.
+
+It also assigns spreadsheet-style refs via `cellRef(...)`, for example:
+
+- `A1`
+- `B3`
+- `D5`
+
+### Initial Cell Geometry
+
+MinerU currently gives reliable table-level boxes, but not true per-cell boxes.
+
+`buildExtractedTable(...)` creates an initial `uniform_grid` geometry by splitting the table bbox by row and column count. This is a fallback, not the preferred precision path.
+
+## Refining Cell Coordinates
+
+### `src/table-compare/table-geometry.ts`
+
+The main exported function is:
+
+```ts
+refineDocumentTablesWithPdfRulingLines(documentPath, parsed, workDir)
+```
+
+This improves cell bboxes when the input is a PDF or PNG with visible table ruling lines.
+
+### Supported Source Kinds
+
+`sourceDocumentKind(...)` currently recognizes:
+
+- `.pdf`
+- `.png`
+
+Other file types keep the extracted uniform-grid geometry.
+
+### PDF Rendering
+
+For PDFs, `renderPdfPage(...)` runs:
+
+```text
+pdftoppm -png -f <page> -l <page> -singlefile -r 144
+```
+
+The rendered PNG is loaded with `pngjs`.
+
+For PNG input, `loadPngPage(...)` reads the image directly.
+
+### Grid Detection
+
+`detectGrid(...)`:
+
+1. Maps MinerU page-space table bbox to rendered image pixels.
+2. Crops around the table area.
+3. Finds vertical and horizontal dark-line clusters.
+4. Selects the strongest expected number of boundaries:
+   - `colCount + 1` vertical boundaries;
+   - `rowCount + 1` horizontal boundaries.
+
+Key helpers:
+
+- `findLineClusters(...)`
+- `clusterAdjacentScores(...)`
+- `summarizeCluster(...)`
+- `selectBoundaries(...)`
+
+### Applying The Detected Grid
+
+`applyDetectedGrid(...)` replaces each cell bbox with boundaries from actual detected ruling lines.
+
+If detection succeeds:
+
+```ts
+geometrySource: "pdf_ruling_lines"
+```
+
+If detection fails:
+
+```ts
+geometrySource: "uniform_grid"
+```
+
+This is what lets irregular tables with uneven row heights or column widths redline correctly.
+
+## Semantic Comparison
+
+### `src/table-compare/semantic-compare.ts`
+
+This file owns the semantic comparison data contract and prompt construction.
+
+### `semanticComparisonPlanSchema`
+
+Zod schema for the agent JSON plan.
+
+Required top-level fields:
+
+- `different`
+- `summary`
+- `explanation`
+- `differences`
+
+Optional:
+
+- `rowMatches`
+- `ignored`
+
+Each difference may include:
+
+- `kind`: `cell_changed`, `row_added`, `row_removed`, or `shape_changed`;
+- `cellRefA`;
+- `cellRefB`;
+- `rowIndexA`;
+- `rowIndexB`;
+- `field`;
+- `before`;
+- `after`;
+- `explanation`.
+
+### `compactTableForSemanticAgent(table)`
+
+Produces a compact table representation for the prompt:
+
+- `rowCount`
+- `colCount`
+- rows with `rowIndex`, `isHeader`, and cell refs/text.
+
+This keeps model context focused on structured table evidence rather than raw MinerU output.
+
+### `buildSemanticComparisonPrompt(...)`
+
+Builds the prompt used by `workflow.ts`.
+
+The prompt tells the agent to:
+
+- infer corresponding columns by meaning;
+- infer corresponding rows by business content;
+- ignore visual style and row/column order;
+- ignore non-material extra template columns;
+- report material missing/extra columns;
+- directly compare same-format/same-order tables;
+- include cell refs for redlining;
+- return JSON only.
+
+It includes:
+
+- compact Document A table;
+- compact Document B table;
+- baseline document choice;
+- same-grid candidate differences.
+
+### Same-Grid Candidate Differences
+
+`compactCandidateDifferences(...)` calls the legacy exact-grid helper:
+
+```ts
+compareFirstTables(tableA, tableB)
+```
+
+The result is included as evidence for the semantic agent. It is not the final judgement. This helps catch same-format cell changes while still allowing row reorder and template differences.
+
+### `parseSemanticComparisonPlanText(text)`
+
+Extracts and validates the agent JSON plan.
+
+It supports responses that accidentally include a fenced JSON block by extracting the first `{ ... }` object before schema validation.
+
+### `needsSameFormatCandidateReview(...)`
+
+Determines whether the agent may have missed obvious same-format differences.
+
+It returns true when:
+
+- the tables have the same shape;
+- there are candidate positional differences;
+- the agent returned fewer differences than the candidates.
+
+### `buildSameFormatCandidateReviewPrompt(...)`
+
+Creates a second-pass prompt asking the agent to review omitted same-grid differences. This is used by `workflow.ts` only when `needsSameFormatCandidateReview(...)` is true.
+
+### `buildSemanticComparisonResult(...)`
+
+Turns the validated agent plan into a `TableComparisonResult`.
+
+It:
+
+- maps cell refs back to `ExtractedCell` objects;
+- creates `TableDifference` entries;
+- attaches `bboxA` and `bboxB`;
+- preserves page indexes;
+- records semantic row matches;
+- records ignored refs;
+- ensures explanations mention concrete diff refs/before/after values.
+
+### `buildDifference(...)`
+
+This is where visual redline anchoring becomes concrete.
+
+Given a planned semantic difference, it picks:
+
+- the referenced cell in A, if available;
+- the referenced cell in B, if available;
+- row-level bounding boxes for row-added/row-removed style changes;
+- fallback bboxes if needed.
+
+The selected bbox is later consumed by `redline.ts`.
+
+## Redline PDF Generation
+
+### `src/table-compare/redline.ts`
+
+The main exported function is:
+
+```ts
+createRedlinePdf(comparison, baselineDocumentPath, outputPath, baselineDocument)
+```
+
+### Baseline Document
+
+The baseline defaults to `documentB`, but the API accepts `baselineDocument=documentA` or `documentB`.
+
+The redline renderer uses:
+
+- `bboxA` when redlining `documentA`;
+- `bboxB` when redlining `documentB`;
+- fallback boxes if one side is missing.
+
+### Loading The Document
+
+`loadOrCreatePdf(...)`:
+
+- loads a PDF directly if the baseline is `.pdf`;
+- embeds PNG/JPG into a new PDF if the baseline is an image;
+- creates a blank fallback page for unsupported extensions.
+
+### Coordinate Mapping
+
+MinerU coordinates use top-left origin page space. PDF drawing uses bottom-left origin.
+
+`mapBBoxToPdf(...)` converts:
+
+- source page width/height;
+- target PDF page width/height;
+- bbox coordinates;
+
+into `x`, `y`, `width`, and `height` for `pdf-lib`.
+
+### Drawing
+
+For each difference with a bbox, `createRedlinePdf(...)` draws:
+
+- translucent red rectangle;
+- red border;
+- short label from `diff.explanation` or `diff.ref`.
+
+If there are no differences, it writes:
+
+```text
+No table differences found by MinerU-grounded comparison.
+```
+
+## Types And Result Shape
+
+### `src/table-compare/types.ts`
+
+Important shared types:
+
+- `ParsedDocumentTables`
+- `ExtractedTable`
+- `ExtractedCell`
+- `TableDifference`
+- `TableComparisonResult`
+- `CompareJobRecord`
+
+### `TableComparisonResult`
+
+The API result contains:
+
+- `different`: boolean;
+- `summary`: short judgement;
+- `explanation`: human-readable explanation;
+- `differences`: changed cells/rows/shapes with refs and bboxes;
+- `tableA`;
+- `tableB`;
+- `comparisonMode: "semantic"`;
+- `baselineDocument`;
+- `semantic`: row matches and ignored fields;
+- `redlinePdfPath`;
+- `agent`: execution metadata and agent response text.
+
+## Storage Layout
+
+### Per-Job Input Files
+
+Created by `TableCompareJobManager.submit(...)`:
+
+```text
+data/table-compare/input/<job_id>/
+```
+
+Contains the uploaded documents with sanitized names.
+
+### Per-Job Output Files
+
+Created by `TableCompareJobManager.run(...)`:
+
+```text
+data/table-compare/results/<job_id>/
+```
 
 Contains:
 
-- GPU evidence;
-- architecture explanation;
-- concurrency model;
-- benchmark findings;
-- Docker run instructions;
-- API surface;
-- local development notes.
+- `redline.pdf`;
+- geometry artifacts such as rendered page PNGs under `geometry-a` and `geometry-b` when requested.
 
-Change this file when:
+### Semantic Test Bundles
 
-- changing operational defaults;
-- adding deployment instructions;
-- recording new benchmark findings.
-
-## Runtime Data and Generated Files
-
-### `data/test-pdfs/`
-
-Downloaded benchmark corpus. Source of truth is `scripts/download_test_pdfs.py`.
-
-### `data/input/`
-
-Uploaded PDFs grouped by platform job id.
-
-Example:
+Created by `scripts/test_table_compare_semantic_e2e.ts`:
 
 ```text
-data/input/<job_id>/<uploaded_file>.pdf
+data/table-compare/semantic-tests/<case_name>/
+  input/
+    base.pdf
+    changed.pdf
+  output/
+    result.json
+    redline.pdf
 ```
 
-This is runtime data, not source code.
+Current semantic cases:
 
-### `data/results/`
+- `same-format-reordered`
+- `different-format-same-content`
+- `different-format-quantity-change`
 
-Normalized platform results grouped by job id.
+## Test Coverage
 
-Example:
+### `npm run typecheck`
+
+Runs:
 
 ```text
-data/results/<job_id>/result.json
+tsc --noEmit
 ```
 
-This is runtime data, not source code.
+### `npm run test:table-unit`
 
-### `data/e2e-*.json`
+Runs `scripts/test_table_compare_unit.ts`.
 
-Benchmark summaries written by `scripts/run_e2e.py`.
+This covers core comparison/geometry behavior without going through the HTTP API.
 
-These are useful for audit/debugging, but they are generated artifacts.
+### `npm run test:table-e2e`
 
-### `__pycache__/`
+Runs `scripts/test_table_compare_e2e.ts`.
 
-Python bytecode generated by `python -m compileall` or imports.
+This submits fixture PDFs through the real async API and asserts:
 
-These are generated artifacts and can be deleted safely.
+- results are produced by `semanticTableCompareAgent`;
+- the MinerU pair parse tool was invoked;
+- semantic agent response text exists;
+- expected refs and values are found;
+- PDF ruling-line geometry is used for fixture PDFs;
+- irregular table bboxes are wider/taller than uniform fallback would be;
+- redline PDFs download and are non-empty.
 
-## Where To Make Common Changes
+### `npm run test:table-semantic-e2e`
 
-Add a new API field:
+Runs `scripts/test_table_compare_semantic_e2e.ts`.
 
-1. Add it to `ParseOptions` in `models.py`.
-2. Add a form field in `main.py`.
-3. Forward it in `mineru_client.py` if MinerU needs it.
-4. Update README/API docs.
+This creates PDFs through Gotenberg and submits them through the async API.
 
-Change default concurrency:
+Cases:
 
-1. Update `docker-compose.yml`.
-2. Update `.env.example`.
-3. Update the README benchmark/concurrency section.
-4. Re-run `scripts/run_e2e.py`.
+- same format, same content, different row order;
+- different template, same content;
+- different template, quantity difference.
 
-Add durable queueing:
+It also writes the semantic test bundles described above.
 
-1. Replace or extend `JobManager` in `worker.py`.
-2. Persist job records outside process memory.
-3. Make `GET /v1/jobs/{job_id}` load from durable state.
-4. Add startup recovery behavior.
+### Latest Verification Snapshot
 
-Add multiple MinerU workers:
+After the single-agent refactor, the following passed:
 
-1. Add more MinerU services or use `mineru-router`.
-2. Point `MINERU_BASE_URL` at the router, or add routing inside `MinerUClient`.
-3. Track per-worker health and queue depth.
+```text
+npm run typecheck
+npm run test:table-unit
+npm run test:table-semantic-e2e
+npm run test:table-e2e
+```
 
-Move storage to object storage:
+## Important Design Decisions
 
-1. Replace local write/read behavior in `storage.py`.
-2. Decide whether MinerU receives local files, pre-signed URLs, or streamed bytes.
-3. Keep the public result contract stable.
+### One API-Facing Agent
+
+The current API path uses only `semanticTableCompareAgent`.
+
+The previous outer `tableCompareAgent` was removed because it only routed to the semantic path. Keeping it made the architecture look agent-driven while adding no useful decision point.
+
+### Pair Parse Tool
+
+The semantic agent invokes a single pair tool:
+
+```text
+parse-document-pair-tables-with-mineru
+```
+
+This keeps MinerU parsing agent-invoked while making document A/B binding deterministic.
+
+### Semantic Reasoning Is Agent-Owned
+
+The code does not hardcode business columns such as "quantity" or "part code" as the matching logic.
+
+Instead:
+
+- MinerU supplies structured cells and refs;
+- code supplies compact evidence and candidate positional differences;
+- the semantic agent decides row/column correspondence and materiality;
+- code validates the agent's JSON and maps refs to geometry.
+
+### Geometry Is Deterministic
+
+The model does not draw boxes.
+
+The agent returns refs and row indexes. Deterministic TypeScript maps those refs to MinerU-derived cell bboxes and writes the PDF overlay.
+
+### Same-Format Guardrail
+
+For same-shape tables, positional candidate differences are included as prompt evidence.
+
+If the agent omits likely real differences, the workflow asks for a second semantic review. This avoids losing obvious same-format changes without falling back to a hardcoded exact-grid judgement.
+
+### Baseline Redlining
+
+The API can redline either document. The selected baseline controls whether `bboxA` or `bboxB` is preferred.
+
+Default is `documentB`.
+
+## Failure Behavior
+
+Common failure points:
+
+- missing multipart field: HTTP `400`;
+- invalid `baselineDocument`: HTTP `400`;
+- unknown job id: HTTP `404`;
+- result requested before completion: HTTP `202`;
+- failed job result/redline request: HTTP `409`;
+- MinerU task failure or timeout: job becomes `failed`;
+- no tables in either parsed document: job becomes `failed`;
+- semantic agent fails to invoke pair parse tool: job becomes `failed`;
+- semantic JSON cannot be parsed/repaired: job becomes `failed`.
+
+## Files To Start With During Review
+
+Read these in order for the cleanest mental model:
+
+1. `src/table-compare/server.ts`
+2. `src/table-compare/job-manager.ts`
+3. `src/table-compare/workflow.ts`
+4. `src/mastra/agents/semantic-table-compare-agent.ts`
+5. `src/mastra/tools/mineru-table-tools.ts`
+6. `src/table-compare/mineru-client.ts`
+7. `src/table-compare/table-extractor.ts`
+8. `src/table-compare/table-geometry.ts`
+9. `src/table-compare/semantic-compare.ts`
+10. `src/table-compare/redline.ts`
+11. `src/table-compare/types.ts`
+

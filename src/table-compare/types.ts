@@ -55,7 +55,9 @@ export type DifferenceKind =
   | "cell_changed"
   | "cell_added"
   | "cell_removed"
-  | "shape_changed";
+  | "shape_changed"
+  | "row_added"
+  | "row_removed";
 
 export interface TableDifference {
   kind: DifferenceKind;
@@ -68,6 +70,9 @@ export interface TableDifference {
   bboxB?: BBox;
   pageIndexA?: number;
   pageIndexB?: number;
+  field?: string;
+  matchKey?: string;
+  explanation?: string;
 }
 
 export interface TableComparisonResult {
@@ -77,6 +82,19 @@ export interface TableComparisonResult {
   differences: TableDifference[];
   tableA: ExtractedTable;
   tableB: ExtractedTable;
+  comparisonMode?: "semantic";
+  baselineDocument?: "documentA" | "documentB";
+  semantic?: {
+    commonFields: string[];
+    ignoredFieldsA: string[];
+    ignoredFieldsB: string[];
+    matchedRows: Array<{
+      key: string;
+      rowIndexA: number;
+      rowIndexB: number;
+      score: number;
+    }>;
+  };
   redlinePdfPath?: string;
   agent?: {
     id: string;
@@ -99,6 +117,7 @@ export interface CompareJobRecord {
     documentA: string;
     documentB: string;
   };
+  baselineDocument?: "documentA" | "documentB";
   createdAt: string;
   updatedAt: string;
   startedAt?: string;

@@ -9,7 +9,7 @@ export const createRedlinePdfTool = createTool({
   description:
     "Create a PDF overlay that marks table differences using MinerU-derived page coordinates and bounding boxes.",
   inputSchema: z.object({
-    comparison: z.any().describe("TableComparisonResult produced by compare-mineru-parsed-tables."),
+    comparison: z.any().describe("TableComparisonResult produced from the semantic table comparison plan."),
     documentBPath: z.string().describe("Path to the second/source PDF. The redline is drawn on this document when it is a PDF."),
     outputPath: z.string().describe("Absolute destination path for the redlined PDF."),
   }),

@@ -45,11 +45,17 @@ app.post(
         response.status(400).json({ detail: "Upload documentA and documentB multipart fields" });
         return;
       }
+      const baselineDocument = parseBaselineDocument(request.body?.baselineDocument ?? request.body?.baseline);
+      if ((request.body?.baselineDocument || request.body?.baseline) && !baselineDocument) {
+        response.status(400).json({ detail: "baselineDocument must be documentA or documentB" });
+        return;
+      }
 
-      const job = await jobs.submit({ documentA, documentB });
+      const job = await jobs.submit({ documentA, documentB, baselineDocument });
       response.status(202).json({
         jobId: job.id,
         status: job.status,
+        baselineDocument: job.baselineDocument,
         statusUrl: `/v1/table-comparisons/${job.id}`,
         resultUrl: `/v1/table-comparisons/${job.id}/result`,
         redlinePdfUrl: `/v1/table-comparisons/${job.id}/redline.pdf`,
@@ -119,8 +125,16 @@ function serializeJob(job: ReturnType<TableCompareJobManager["get"]>) {
     updatedAt: job.updatedAt,
     startedAt: job.startedAt,
     completedAt: job.completedAt,
+    baselineDocument: job.baselineDocument,
     error: job.error,
     resultUrl: `/v1/table-comparisons/${job.id}/result`,
     redlinePdfUrl: `/v1/table-comparisons/${job.id}/redline.pdf`,
   };
+}
+
+function parseBaselineDocument(value: unknown): "documentA" | "documentB" | undefined {
+  if (value === "documentA" || value === "documentB") {
+    return value;
+  }
+  return undefined;
 }

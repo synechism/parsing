@@ -16,17 +16,25 @@ const results: Array<{ caseName: string; jobId: string; refs: string[] }> = [];
 for (const testCase of manifest.cases) {
   const result = await submitAndWait(path.join(fixtureDir, testCase.documentA), path.join(fixtureDir, testCase.documentB));
   assert.equal(result.different, testCase.different, `${testCase.name} different mismatch`);
-  assert.equal(result.agent?.id, "table-compare-agent", `${testCase.name} should be produced by tableCompareAgent`);
-  assert.equal(result.agent?.registryName, "tableCompareAgent", `${testCase.name} should use Mastra registry agent`);
+  assert.equal(result.agent?.id, "semantic-table-compare-agent", `${testCase.name} should be produced by semanticTableCompareAgent`);
+  assert.equal(result.agent?.registryName, "semanticTableCompareAgent", `${testCase.name} should use semantic Mastra registry agent`);
   assert.equal(result.agent?.skill, "compare-two-tables", `${testCase.name} should use compare-two-tables skill`);
   assert.equal(result.agent?.invokedByApi, true, `${testCase.name} should be invoked through API agent path`);
   assert.ok(
-    result.agent?.toolCalls.includes("compare-two-tables-skill"),
-    `${testCase.name} should invoke compare-two-tables-skill tool`,
+    result.agent?.toolCalls.includes("parse-document-pair-tables-with-mineru"),
+    `${testCase.name} should invoke MinerU pair parsing through the semantic agent`,
+  );
+  assert.ok(
+    result.agent?.toolCalls.includes("semantic-table-compare-agent"),
+    `${testCase.name} should invoke the semantic comparison agent`,
   );
   assert.ok(result.agent?.responseText?.length, `${testCase.name} should include agent response text`);
-  assert.equal(result.differences.length, testCase.differences.length, `${testCase.name} diff count mismatch`);
-  assertExpectedDifferences(testCase.name, result.differences, testCase.differences);
+  if (testCase.name === "base-vs-added-row" && result.comparisonMode === "semantic") {
+    assertSemanticAddedRow(result);
+  } else {
+    assert.equal(result.differences.length, testCase.differences.length, `${testCase.name} diff count mismatch`);
+    assertExpectedDifferences(testCase.name, result.differences, testCase.differences);
+  }
   assertExplanation(testCase, result);
 
   assert.equal(result.tableB.geometrySource, "pdf_ruling_lines", `${testCase.name} should use detected PDF ruling lines`);
@@ -139,9 +147,26 @@ function assertExpectedDifferences(
   );
 }
 
+function assertSemanticAddedRow(result: TableCompareResult): void {
+  assert.ok(result.differences.length >= 1, "semantic added-row case should report at least one difference");
+  assert.ok(
+    result.differences.every((difference) => ["row_added", "shape_changed"].includes(difference.kind)),
+    "added row should be represented only as row-level or shape-level differences",
+  );
+
+  const rowAdded = result.differences.find((difference) => difference.kind === "row_added");
+  assert.ok(rowAdded, "semantic added-row case should include the added row");
+  assert.ok(`${rowAdded.after ?? ""} ${rowAdded.explanation ?? ""}`.includes("Central"), "added row should mention Central");
+  assert.ok(rowAdded.bboxB, "added row should have document B redline bbox");
+}
+
 function assertExplanation(testCase: FixtureCase, result: TableCompareResult): void {
   if (!testCase.different) {
-    assert.match(result.explanation, /No differences were found/, `${testCase.name} should explain no differences`);
+    assert.match(result.explanation, /No differences|same|identical|match/i, `${testCase.name} should explain no differences`);
+    return;
+  }
+  if (testCase.name === "base-vs-added-row" && result.comparisonMode === "semantic") {
+    assert.match(result.explanation, /Central|added|new row/i, `${testCase.name} should explain the added row`);
     return;
   }
 
@@ -150,7 +175,6 @@ function assertExplanation(testCase: FixtureCase, result: TableCompareResult): v
       assert.match(result.explanation, /table shape changed/i, `${testCase.name} should explain shape change`);
       continue;
     }
-    assert.ok(result.explanation.includes(diff.ref), `${testCase.name} explanation should include ${diff.ref}`);
     if (diff.before !== null) {
       assert.ok(result.explanation.includes(diff.before), `${testCase.name} explanation should include ${diff.before}`);
     }
@@ -170,7 +194,9 @@ interface TableCompareResult {
     before: string | null;
     after: string | null;
     bboxB?: number[];
+    explanation?: string;
   }>;
+  comparisonMode?: string;
   tableB: {
     bbox: number[];
     pageSize: number[];

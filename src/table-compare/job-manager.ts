@@ -28,7 +28,11 @@ export class TableCompareJobManager {
     return this.config.concurrency;
   }
 
-  async submit(files: { documentA: Express.Multer.File; documentB: Express.Multer.File }): Promise<CompareJobRecord> {
+  async submit(files: {
+    documentA: Express.Multer.File;
+    documentB: Express.Multer.File;
+    baselineDocument?: "documentA" | "documentB";
+  }): Promise<CompareJobRecord> {
     const id = randomUUID().replaceAll("-", "");
     const createdAt = new Date().toISOString();
     const inputDirectory = path.join(this.config.storageRoot, "table-compare", "input", id);
@@ -49,6 +53,7 @@ export class TableCompareJobManager {
         documentA: documentAPath,
         documentB: documentBPath,
       },
+      baselineDocument: files.baselineDocument,
       createdAt,
       updatedAt: createdAt,
     };
@@ -98,6 +103,7 @@ export class TableCompareJobManager {
         documentAPath: record.inputPaths.documentA,
         documentBPath: record.inputPaths.documentB,
         outputDirectory,
+        baselineDocument: record.baselineDocument,
       });
       record.status = "completed";
     } catch (error) {

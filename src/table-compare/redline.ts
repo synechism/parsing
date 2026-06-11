@@ -7,21 +7,32 @@ import type { BBox, TableComparisonResult, TableDifference } from "./types";
 
 export async function createRedlinePdf(
   comparison: TableComparisonResult,
-  documentBPath: string,
+  baselineDocumentPath: string,
   outputPath: string,
+  baselineDocument: "documentA" | "documentB" = comparison.baselineDocument ?? "documentB",
 ): Promise<string> {
   await mkdir(path.dirname(outputPath), { recursive: true });
 
-  const pdf = await loadOrCreatePdf(documentBPath, comparison);
+  const pdf = await loadOrCreatePdf(baselineDocumentPath, comparison);
   const font = await pdf.embedFont(StandardFonts.HelveticaBold);
   const pages = pdf.getPages();
-  const marks = comparison.differences.filter((diff) => diff.bboxB || diff.bboxA);
+  const marks = comparison.differences.filter((diff) =>
+    baselineDocument === "documentA" ? diff.bboxA || diff.bboxB : diff.bboxB || diff.bboxA,
+  );
 
   for (const diff of marks) {
-    const pageIndex = Math.max(0, Math.min(pages.length - 1, diff.pageIndexB ?? comparison.tableB.pageIndex ?? 0));
+    const preferredPageIndex = baselineDocument === "documentA" ? diff.pageIndexA : diff.pageIndexB;
+    const fallbackPageIndex = baselineDocument === "documentA" ? comparison.tableA.pageIndex : comparison.tableB.pageIndex;
+    const pageIndex = Math.max(0, Math.min(pages.length - 1, preferredPageIndex ?? fallbackPageIndex ?? 0));
     const page = pages[pageIndex];
-    const bbox = diff.bboxB ?? diff.bboxA ?? comparison.tableB.bbox;
-    const sourcePage = comparison.tableB.pageSize ?? comparison.tableA.pageSize;
+    const bbox =
+      baselineDocument === "documentA"
+        ? diff.bboxA ?? diff.bboxB ?? comparison.tableA.bbox
+        : diff.bboxB ?? diff.bboxA ?? comparison.tableB.bbox;
+    const sourcePage =
+      baselineDocument === "documentA"
+        ? comparison.tableA.pageSize ?? comparison.tableB.pageSize
+        : comparison.tableB.pageSize ?? comparison.tableA.pageSize;
     const rect = mapBBoxToPdf(bbox, sourcePage ?? [page.getWidth(), page.getHeight()], page.getWidth(), page.getHeight());
 
     page.drawRectangle({
@@ -35,7 +46,7 @@ export async function createRedlinePdf(
       opacity: 0.28,
       borderOpacity: 0.95,
     });
-    page.drawText(diff.ref, {
+    page.drawText(labelForDifference(diff), {
       x: rect.x,
       y: Math.min(page.getHeight() - 10, rect.y + rect.height + 3),
       size: 7,
@@ -58,6 +69,11 @@ export async function createRedlinePdf(
   const bytes = await pdf.save();
   await writeFile(outputPath, bytes);
   return outputPath;
+}
+
+function labelForDifference(diff: TableDifference): string {
+  const label = diff.explanation ?? diff.ref;
+  return label.length > 72 ? `${label.slice(0, 69)}...` : label;
 }
 
 async function loadOrCreatePdf(documentPath: string, comparison: TableComparisonResult): Promise<PDFDocument> {

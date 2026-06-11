@@ -274,36 +274,34 @@ The table comparison path is a separate Node service named `table-agent`:
 flowchart TD
   A[Client or agent<br/>POST /v1/table-comparisons] --> B[src/table-compare/server.ts<br/>validate multipart fields<br/>return job URLs]
   B --> C[src/table-compare/job-manager.ts<br/>save uploads under /data/table-compare/input/job_id<br/>enqueue background work]
-  C --> D[src/table-compare/workflow.ts<br/>load tableCompareAgent from Mastra<br/>call agent.generate]
+  C --> D[src/table-compare/workflow.ts<br/>load semanticTableCompareAgent from Mastra<br/>call agent.generate]
   D --> E[src/mastra/index.ts<br/>Mastra registry]
-  E --> F[src/mastra/agents/table-compare-agent.ts<br/>agent instructions and tool registration]
-  F --> G[src/mastra/tools/table-compare-tools.ts<br/>compare-two-tables-skill tool]
-  G --> H[src/mastra/tools/mineru-table-tools.ts<br/>parse both documents with MinerU]
+  E --> F[src/mastra/agents/semantic-table-compare-agent.ts<br/>single API-facing semantic agent]
+  F --> H[src/mastra/tools/mineru-table-tools.ts<br/>agent invokes MinerU parse tool twice]
   H --> I[src/table-compare/mineru-client.ts<br/>POST /tasks and poll MinerU]
   I --> J[mineru container<br/>CUDA/VLM/OCR/table parsing]
   H --> K[src/table-compare/table-extractor.ts<br/>content_list table HTML<br/>middle_json page/table boxes]
   K --> L[src/table-compare/table-geometry.ts<br/>Poppler render<br/>PDF ruling-line cell boxes]
-  G --> M[src/table-compare/table-compare.ts<br/>compare cells by refs]
-  G --> N[src/table-compare/redline.ts<br/>draw red boxes on document B]
-  N --> O[/data/table-compare/results/job_id/redline.pdf]
-  G --> P[different, explanation, differences,<br/>redlinePdfPath, agent metadata]
+  L --> M[src/table-compare/workflow.ts<br/>build compact evidence prompt<br/>same-grid candidate diffs]
+  M --> N[src/mastra/agents/semantic-table-compare-agent.ts<br/>semantic column/row matching<br/>returns JSON plan]
+  N --> S[src/table-compare/semantic-compare.ts<br/>validate JSON plan<br/>map refs to bboxes]
+  S --> R[src/table-compare/redline.ts<br/>draw explained boxes on baseline document]
+  R --> O[/data/table-compare/results/job_id/redline.pdf]
+  S --> P[different, explanation, differences,<br/>redlinePdfPath, agent metadata]
   P --> Q[src/table-compare/server.ts<br/>GET /result and /redline.pdf]
 ```
 
-The async API now calls the Mastra agent for every comparison job. `src/table-compare/workflow.ts` is the API-to-agent bridge: it retrieves `tableCompareAgent` from `src/mastra/index.ts`, calls `agent.generate(...)`, restricts the active tools to `compareTwoTablesSkillTool`, and extracts the tool result from Mastra's tool-result payload. If the agent does not execute the skill tool, the job fails instead of silently falling back to a direct comparison path.
+The async API now calls the semantic Mastra agent for every comparison job. `src/table-compare/workflow.ts` is the API-to-agent bridge: it retrieves `semanticTableCompareAgent` from `src/mastra/index.ts`, calls `agent.generate(...)`, and restricts the active tool set to `parseDocumentPairTablesTool` during the parsing phase. If the agent does not invoke MinerU for both inputs, the job fails instead of silently falling back to a direct non-agent path.
 
-The deterministic pieces still exist, but they are behind Mastra tools. The full compare skill lives in `src/mastra/tools/table-compare-tools.ts` alongside the lower-level parsed-table comparison tool. There is no separate `agent-runner.ts` or `compare-two-tables-skill-tool.ts`; those responsibilities are folded into `workflow.ts` and `table-compare-tools.ts`.
+After parsing, `workflow.ts` builds a compact MinerU-grounded evidence prompt from the parsed tables, same-grid candidate differences, and baseline redline choice. The same `semanticTableCompareAgent` then returns a JSON semantic comparison plan. Deterministic code validates that plan, maps returned cell refs to MinerU-derived bounding boxes, and writes the redline PDF.
 
 ### Why The Agent Uses Tools
 
 The agent is not asked to visually guess table differences. Its tools force the workflow through MinerU first:
 
-- `parse-document-tables-with-mineru`: calls the local MinerU API and extracts structured tables.
-- `compare-mineru-parsed-tables`: compares normalized parsed cell text.
-- `create-table-redline-pdf`: renders a visual PDF redline from MinerU-derived coordinates.
-- `compare-two-tables-skill`: the API-facing Mastra tool that orchestrates parsing both documents, comparing the first parsed table, and writing the redline PDF.
+- `parse-document-pair-tables-with-mineru`: calls the local MinerU API for both documents and extracts structured tables without letting the model mix up document A and document B.
 
-This keeps the judgement grounded in MinerU's parsed output rather than native multimodal inspection. The LLM-facing Mastra agent can explain or orchestrate, but the actual pass/fail comparison is deterministic code.
+This keeps the judgement grounded in MinerU's parsed output rather than native multimodal inspection. The semantic agent decides which rows/columns correspond; code validates the returned JSON and maps the agent's cell refs back to MinerU-derived bounding boxes.
 
 ### Coordinate Design
 

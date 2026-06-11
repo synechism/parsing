@@ -5,6 +5,7 @@ import path from "node:path";
 import { PDFDocument } from "pdf-lib";
 
 import { createRedlinePdf } from "../src/table-compare/redline";
+import { buildSemanticComparisonResult } from "../src/table-compare/semantic-compare";
 import { compareFirstTables } from "../src/table-compare/table-compare";
 import { extractTablesFromMinerUResult } from "../src/table-compare/table-extractor";
 import type { BBox } from "../src/table-compare/types";
@@ -49,6 +50,71 @@ const identical = compareFirstTables(base, base);
 assert.equal(identical.different, false);
 assert.equal(identical.differences.length, 0);
 assert.match(identical.explanation, /No differences were found/);
+
+const reorderedHtml =
+  "<table><tr><td>Region</td><td>Q1 Revenue</td><td>Q2 Revenue</td><td>Status</td></tr><tr><td>East</td><td>$143,100</td><td>$149,900</td><td>Review</td></tr><tr><td>North</td><td>$120,000</td><td>$135,500</td><td>Approved</td></tr><tr><td>West</td><td>$110,300</td><td>$118,400</td><td>Approved</td></tr><tr><td>South</td><td>$98,250</td><td>$101,750</td><td>Approved</td></tr></table>";
+const reordered = extractTablesFromMinerUResult(makeMinerUResult(reorderedHtml), "reordered.pdf", "unit-reordered").tables[0];
+const semanticReordered = buildSemanticComparisonResult(
+  base,
+  reordered,
+  {
+    different: false,
+    summary: "The tables match semantically despite row reordering.",
+    explanation: "Rows were matched by region and all shared values match.",
+    rowMatches: [
+      { rowIndexA: 1, rowIndexB: 2, rationale: "North row", confidence: 1 },
+      { rowIndexA: 2, rowIndexB: 4, rationale: "South row", confidence: 1 },
+      { rowIndexA: 3, rowIndexB: 1, rationale: "East row", confidence: 1 },
+      { rowIndexA: 4, rowIndexB: 3, rationale: "West row", confidence: 1 },
+    ],
+    differences: [],
+  },
+  { baselineDocument: "documentB" },
+);
+assert.equal(semanticReordered.different, false);
+assert.equal(semanticReordered.comparisonMode, "semantic");
+assert.equal(semanticReordered.semantic?.matchedRows.length, 4);
+
+const payableHtml =
+  "<table><tr><td>Part Code</td><td>Part Name</td><td>Specification</td><td>Quantity</td><td>Unit Price</td></tr><tr><td>P-100</td><td>Valve</td><td>SS 1 inch</td><td>10</td><td>$12.50</td></tr><tr><td>P-200</td><td>Gasket</td><td>NBR</td><td>25</td><td>$1.10</td></tr></table>";
+const invoiceHtml =
+  "<table><tr><td>Item</td><td>Description</td><td>Mfr Part</td><td>Qty</td><td>Price Each</td><td>Line Total</td></tr><tr><td>P-200</td><td>NBR gasket</td><td>MFG-GSK</td><td>25</td><td>$1.10</td><td>$27.50</td></tr><tr><td>P-100</td><td>Stainless valve</td><td>MFG-VLV</td><td>12</td><td>$12.50</td><td>$150.00</td></tr></table>";
+const payable = extractTablesFromMinerUResult(makeMinerUResult(payableHtml), "payable.pdf", "unit-payable").tables[0];
+const invoice = extractTablesFromMinerUResult(makeMinerUResult(invoiceHtml), "invoice.pdf", "unit-invoice").tables[0];
+const semanticInvoice = buildSemanticComparisonResult(
+  payable,
+  invoice,
+  {
+    different: true,
+    summary: "The invoice differs from the payable on one quantity.",
+    explanation: "Rows were matched by part code. Quantity for P-100 differs.",
+    rowMatches: [
+      { rowIndexA: 1, rowIndexB: 2, rationale: "same part code P-100", confidence: 1 },
+      { rowIndexA: 2, rowIndexB: 1, rationale: "same part code P-200", confidence: 1 },
+    ],
+    differences: [
+      {
+        kind: "cell_changed",
+        cellRefA: "D2",
+        cellRefB: "D3",
+        rowIndexA: 1,
+        rowIndexB: 2,
+        field: "quantity",
+        before: "10",
+        after: "12",
+        explanation: "Quantity differs for P-100: payable has 10 and invoice has 12.",
+      },
+    ],
+    ignored: [{ refsA: ["C1"], refsB: ["C1", "F1"], reason: "non-shared template columns were not material to the quantity/price match" }],
+  },
+  { baselineDocument: "documentB" },
+);
+assert.equal(semanticInvoice.different, true);
+assert.equal(semanticInvoice.differences.length, 1);
+assert.equal(semanticInvoice.differences[0].ref, "D3");
+assert.equal(semanticInvoice.differences[0].field, "quantity");
+assert.ok(semanticInvoice.differences[0].bboxB, "semantic invoice difference should anchor to document B");
+assert.match(semanticInvoice.explanation, /Quantity for P-100 differs/);
 
 const blankPdfPath = path.join(artifactDir, "blank.pdf");
 const redlinePdfPath = path.join(artifactDir, "unit-redline.pdf");

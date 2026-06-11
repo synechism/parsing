@@ -9,17 +9,19 @@ Request flow:
 1. `POST /v1/table-comparisons` accepts `documentA` and `documentB` as multipart uploads.
 2. The async API stores both inputs under `data/table-compare/input/<job_id>/`.
 3. A background worker calls `src/table-compare/workflow.ts`.
-4. `workflow.ts` retrieves `tableCompareAgent` from the Mastra registry and calls `agent.generate(...)`.
-5. The agent invokes `compare-two-tables-skill` from `src/mastra/tools/table-compare-tools.ts`.
-6. The skill tool submits both documents to MinerU concurrently.
+4. `workflow.ts` retrieves `semanticTableCompareAgent` from the Mastra registry and calls `agent.generate(...)`.
+5. The semantic agent invokes `parse-document-pair-tables-with-mineru` once with both input paths.
+6. The MinerU tool submits both documents to the local MinerU API.
 7. MinerU parses each document on the GPU and returns structured output.
 8. The table extractor reads MinerU `content_list` and `middle_json`:
    - table HTML from `table_body`
    - precise page-space table body bounding boxes from `middle_json` table spans
    - page geometry from `middle_json.pdf_info[].page_size`
 9. For PDF inputs, the geometry refiner renders the page and detects actual table ruling lines inside the MinerU table bbox.
-10. The comparator normalizes table HTML into a cell grid and compares cells by spreadsheet-style refs such as `C3`.
-11. The redline renderer draws red boxes on top of document B and writes `redline.pdf`.
+10. `workflow.ts` builds a compact semantic evidence prompt from the parsed cell grid and same-grid candidate differences.
+11. The same semantic agent returns a JSON comparison plan with row matches, changed cell refs, explanations, and ignored non-material fields.
+12. `semantic-compare.ts` validates the plan and maps refs such as `C3` back to MinerU-derived bounding boxes.
+13. The redline renderer draws red boxes on top of the selected baseline document and writes `redline.pdf`.
 
 The API does not wait for parsing to finish. It returns a job id immediately and exposes polling endpoints, matching the async pattern used by the existing Python parse API.
 
@@ -40,13 +42,13 @@ In the current observed MinerU output, precise table-body boxes are available in
 - `src/table-compare/mineru-client.ts`: local MinerU `/tasks` client with submit, poll, and result retrieval.
 - `src/table-compare/table-extractor.ts`: converts MinerU output into tables, cells, bboxes, and page geometry.
 - `src/table-compare/table-geometry.ts`: renders PDF pages with Poppler and detects actual table ruling lines for non-uniform cell bboxes.
-- `src/table-compare/table-compare.ts`: deterministic cell-by-cell comparison logic.
+- `src/table-compare/table-compare.ts`: legacy exact cell-by-cell comparison helper for focused diagnostics.
+- `src/table-compare/semantic-compare.ts`: validates semantic-agent JSON plans and maps returned cell refs to MinerU-derived boxes.
 - `src/table-compare/redline.ts`: PDF overlay rendering with `pdf-lib`.
-- `src/table-compare/workflow.ts`: API-to-agent bridge; calls `tableCompareAgent.generate(...)` and extracts the Mastra tool result.
+- `src/table-compare/workflow.ts`: API-to-agent bridge; calls `semanticTableCompareAgent.generate(...)`, requires MinerU parse tool calls, runs semantic judgement, and writes the redline.
 - `src/mastra/tools/mineru-table-tools.ts`: MinerU parsing tool and shared parsing helper.
-- `src/mastra/tools/table-compare-tools.ts`: parsed-table comparison tool plus the API-facing `compare-two-tables-skill` tool.
 - `src/mastra/tools/redline-pdf-tool.ts`: redline PDF tool for direct agent use.
-- `src/mastra/agents/table-compare-agent.ts`: Mastra agent definition and instructions.
+- `src/mastra/agents/semantic-table-compare-agent.ts`: the single API-facing Mastra agent; it invokes MinerU parsing tools and performs semantic row/column matching from structured table evidence.
 - `src/mastra/skills/compare-two-tables.md`: operational skill instructions for the compare workflow.
 - `scripts/generate_table_fixtures.ts`: deterministic table fixture PDF generation through Gotenberg.
 - `docker/mastra-agent.Dockerfile`: container for the Node/Mastra table comparison API.
