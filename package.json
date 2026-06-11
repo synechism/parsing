@@ -16,6 +16,8 @@
     "test:table-unit": "tsx scripts/test_table_compare_unit.ts",
     "test:table-e2e": "tsx scripts/test_table_compare_e2e.ts",
     "test:table-semantic-e2e": "tsx scripts/test_table_compare_semantic_e2e.ts",
+    "test:table-cn-e2e": "tsx scripts/test_cn_manufacturing_e2e.ts",
+    "test:table-manufacturing-e2e": "tsx scripts/test_cn_manufacturing_e2e.ts",
     "generate:table-fixtures": "tsx scripts/generate_table_fixtures.ts",
     "create:table-examples": "tsx scripts/create_table_example_runs.ts"
   },
@@ -33,12 +35,14 @@
   "homepage": "https://github.com/synechism/parsing#readme",
   "dependencies": {
     "@mastra/core": "^1.41.0",
+    "@types/swagger-ui-express": "^4.1.8",
     "cheerio": "^1.2.0",
     "express": "^5.2.1",
     "mastra": "^1.12.2",
     "multer": "^2.1.1",
     "pdf-lib": "^1.17.1",
     "pngjs": "^7.0.0",
+    "swagger-ui-express": "^5.0.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {

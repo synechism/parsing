@@ -3,12 +3,18 @@ import path from "node:path";
 import { mastra } from "../mastra";
 import { createRedlinePdf } from "./redline";
 import {
-  buildSameFormatCandidateReviewPrompt,
+  applyTableSectionSelection,
   buildSemanticComparisonPrompt,
   buildSemanticComparisonResult,
-  needsSameFormatCandidateReview,
+  buildTableSelectionPrompt,
+  mergeSameFormatCandidateDifferences,
+  normalizeTableSelectionPlan,
   parseSemanticComparisonPlanText,
+  parseTableSelectionPlanText,
+  semanticComparisonPlanSchema,
+  tableSelectionPlanSchema,
   type SemanticComparisonPlan,
+  type TableSelectionPlan,
 } from "./semantic-compare";
 import type { ParsedDocumentTables, TableComparisonResult } from "./types";
 
@@ -22,6 +28,9 @@ export interface CompareTwoDocumentsInput {
 const AGENT_REGISTRY_NAME = "semanticTableCompareAgent";
 const PARSE_PAIR_TOOL_KEY = "parseDocumentPairTablesTool";
 const PARSE_PAIR_TOOL_ID = "parse-document-pair-tables-with-mineru";
+const semanticAgentCallTimeoutMs = Number(process.env.TABLE_COMPARE_AGENT_CALL_TIMEOUT_MS ?? 180_000);
+const semanticAgentAttempts = Number(process.env.TABLE_COMPARE_AGENT_ATTEMPTS ?? 6);
+const semanticRepairAttempts = Number(process.env.TABLE_COMPARE_AGENT_REPAIR_ATTEMPTS ?? 4);
 type SemanticAgent = Awaited<ReturnType<typeof mastra.getAgent>>;
 
 export async function compareTwoDocuments(input: CompareTwoDocumentsInput): Promise<TableComparisonResult> {
@@ -35,11 +44,12 @@ export async function compareTwoDocuments(input: CompareTwoDocumentsInput): Prom
     );
   }
 
-  const tableA = parsed.documentA.tables[0];
-  const tableB = parsed.documentB.tables[0];
+  const selection = await selectComparableTableSections(agent, parsed);
+  const tableA = applyTableSectionSelection(parsed.documentA, selection.documentA);
+  const tableB = applyTableSectionSelection(parsed.documentB, selection.documentB);
   const prompt = buildSemanticComparisonPrompt(tableA, tableB, baselineDocument);
   const { plan, responseText } = await runSemanticJudgement(agent, prompt, tableA, tableB);
-  const comparison = buildSemanticComparisonResult(tableA, tableB, plan, { baselineDocument });
+  const comparison = buildSemanticComparisonResult(tableA, tableB, plan, { baselineDocument, selection });
   const baselineDocumentPath = comparison.baselineDocument === "documentA" ? input.documentAPath : input.documentBPath;
   const redlinePdfPath = await createRedlinePdf(
     comparison,
@@ -55,11 +65,38 @@ export async function compareTwoDocuments(input: CompareTwoDocumentsInput): Prom
       id: agent.id,
       registryName: AGENT_REGISTRY_NAME,
       skill: "compare-two-tables",
-      toolCalls: [PARSE_PAIR_TOOL_ID, "semantic-table-compare-agent", "create-table-redline-pdf"],
+      toolCalls: [PARSE_PAIR_TOOL_ID, "semantic-table-section-selection", "semantic-table-compare-agent", "create-table-redline-pdf"],
       invokedByApi: true,
       responseText,
     },
   };
+}
+
+async function selectComparableTableSections(
+  agent: SemanticAgent,
+  parsed: { documentA: ParsedDocumentTables; documentB: ParsedDocumentTables },
+): Promise<TableSelectionPlan> {
+  const prompt = buildTableSelectionPrompt(parsed.documentA, parsed.documentB);
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < semanticAgentAttempts; attempt += 1) {
+    try {
+      const { object: plan } = await generateStructuredWithTimeout<TableSelectionPlan>(
+        agent,
+        prompt,
+        tableSelectionPlanSchema,
+        "table-section-selection",
+        4096,
+      );
+      return normalizeTableSelectionPlan(parsed.documentA, parsed.documentB, plan);
+    } catch (error) {
+      lastError = error;
+      console.warn(`semantic table-section selection attempt ${attempt + 1} failed`, error);
+      await delay(750 * (attempt + 1));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 async function parseDocumentsWithSemanticAgent(
@@ -111,13 +148,26 @@ async function runSemanticJudgement(
   tableA: ParsedDocumentTables["tables"][number],
   tableB: ParsedDocumentTables["tables"][number],
 ): Promise<{ plan: SemanticComparisonPlan; responseText: string }> {
-  const response = await agent.generate(prompt, {
-    activeTools: [],
-    modelSettings: { temperature: 0, maxOutputTokens: 4096 },
-  });
-  const responseText = typeof (response as any).text === "string" ? (response as any).text : "";
-  const parsed = await parseSemanticPlanOrRepair(agent, prompt, responseText);
-  return reviewSameFormatCandidates(agent, prompt, tableA, tableB, parsed.plan, parsed.responseText);
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < semanticAgentAttempts; attempt += 1) {
+    try {
+      const generated = await generateStructuredWithTimeout<SemanticComparisonPlan>(
+        agent,
+        prompt,
+        semanticComparisonPlanSchema,
+        "semantic-table-judgement",
+        8192,
+      );
+      return await reviewSameFormatCandidates(agent, prompt, tableA, tableB, generated.object, generated.responseText);
+    } catch (error) {
+      lastError = error;
+      console.warn(`semantic table judgement attempt ${attempt + 1} failed`, error);
+      await delay(750 * (attempt + 1));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 async function parseSemanticPlanOrRepair(
@@ -128,14 +178,15 @@ async function parseSemanticPlanOrRepair(
   let candidate = text;
   let lastError: unknown;
 
-  for (let attempt = 0; attempt < 3; attempt += 1) {
+  for (let attempt = 0; attempt < semanticRepairAttempts; attempt += 1) {
     try {
       return { plan: parseSemanticComparisonPlanText(candidate), responseText: candidate };
     } catch (error) {
       lastError = error;
     }
 
-    const repair = await agent.generate(
+    const repair = await generateWithTimeout(
+      agent,
       `${prompt}
 
 Your previous response could not be parsed as the required JSON object.
@@ -143,6 +194,42 @@ Parse error: ${lastError instanceof Error ? lastError.message : String(lastError
 
 Return only a valid JSON object matching the requested schema. Do not include markdown or commentary.
 Use strict JSON: double-quoted property names and string values, escaped inner quotes, no trailing commas, no comments.
+Previous response:
+${candidate}`,
+      {
+        activeTools: [],
+        modelSettings: { temperature: 0, maxOutputTokens: 4096 },
+      },
+    );
+    candidate = (repair as any).text ?? "";
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function parseTableSelectionPlanOrRepair(
+  agent: SemanticAgent,
+  prompt: string,
+  text: string,
+): Promise<TableSelectionPlan> {
+  let candidate = text;
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < semanticRepairAttempts; attempt += 1) {
+    try {
+      return parseTableSelectionPlanText(candidate);
+    } catch (error) {
+      lastError = error;
+    }
+
+    const repair = await generateWithTimeout(
+      agent,
+      `${prompt}
+
+Your previous response could not be parsed as the required JSON table selection object.
+Parse error: ${lastError instanceof Error ? lastError.message : String(lastError)}
+
+Return only strict JSON matching the requested table-selection schema. Do not include markdown, comments, or trailing commas.
 Previous response:
 ${candidate}`,
       {
@@ -164,16 +251,9 @@ async function reviewSameFormatCandidates(
   plan: SemanticComparisonPlan,
   responseText: string,
 ): Promise<{ plan: SemanticComparisonPlan; responseText: string }> {
-  if (!needsSameFormatCandidateReview(tableA, tableB, plan)) {
-    return { plan, responseText };
-  }
-
-  const reviewPrompt = buildSameFormatCandidateReviewPrompt(prompt, tableA, tableB, plan);
-  const review = await agent.generate(reviewPrompt, {
-    activeTools: [],
-    modelSettings: { temperature: 0, maxOutputTokens: 4096 },
-  });
-  return parseSemanticPlanOrRepair(agent, reviewPrompt, (review as any).text ?? "");
+  void agent;
+  void prompt;
+  return { plan: mergeSameFormatCandidateDifferences(tableA, tableB, plan), responseText };
 }
 
 function extractParsePairToolResult(value: any): { documentA: ParsedDocumentTables; documentB: ParsedDocumentTables } | undefined {
@@ -211,4 +291,74 @@ function isParsedDocumentTables(value: unknown): value is ParsedDocumentTables {
       Array.isArray(candidate.tables) &&
       Array.isArray(candidate.pages),
   );
+}
+
+async function generateWithTimeout(agent: SemanticAgent, prompt: string, options: Record<string, unknown>): Promise<any> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort(new Error(`semantic agent call timed out after ${semanticAgentCallTimeoutMs}ms`));
+  }, semanticAgentCallTimeoutMs);
+
+  try {
+    return await Promise.race([
+      (agent as any).generate(prompt, {
+        ...options,
+        abortSignal: controller.signal,
+        timeout: semanticAgentCallTimeoutMs,
+      }),
+      new Promise((_, reject) => {
+        controller.signal.addEventListener(
+          "abort",
+          () => reject(controller.signal.reason ?? new Error(`semantic agent call timed out after ${semanticAgentCallTimeoutMs}ms`)),
+          { once: true },
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function generateStructuredWithTimeout<T>(
+  agent: SemanticAgent,
+  prompt: string,
+  schema: unknown,
+  label: string,
+  maxOutputTokens: number,
+): Promise<{ object: T; responseText: string }> {
+  const response = await generateWithTimeout(agent, prompt, {
+    activeTools: [],
+    toolChoice: "none",
+    modelSettings: { temperature: 0, maxOutputTokens, maxRetries: 2 },
+    structuredOutput: {
+      schema,
+      errorStrategy: "strict",
+    },
+  });
+  const object = (response as any).object;
+  if (!object) {
+    throw new Error(`${label} did not produce structured object: ${summarizeAgentResponse(response)}`);
+  }
+  const responseText = typeof (response as any).text === "string" && (response as any).text.trim().length > 0
+    ? (response as any).text
+    : JSON.stringify(object);
+  return { object, responseText };
+}
+
+function summarizeAgentResponse(response: any): string {
+  return JSON.stringify({
+    textLength: typeof response?.text === "string" ? response.text.length : null,
+    textPreview: typeof response?.text === "string" ? response.text.slice(0, 240) : undefined,
+    finishReason: response?.finishReason,
+    usage: response?.usage,
+    hasObject: Boolean(response?.object),
+    headers: {
+      traceId: response?.response?.headers?.["x-ds-trace-id"],
+      contentType: response?.response?.headers?.["content-type"],
+    },
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -1,8 +1,10 @@
 import express from "express";
 import multer from "multer";
+import swaggerUi from "swagger-ui-express";
 
 import { MinerUClient } from "./mineru-client";
 import { TableCompareJobManager } from "./job-manager";
+import { openApiDocument } from "./openapi";
 
 const port = Number(process.env.TABLE_COMPARE_PORT ?? 8090);
 const storageRoot = process.env.TABLE_COMPARE_STORAGE_ROOT ?? process.env.STORAGE_ROOT ?? "/data";
@@ -16,6 +18,22 @@ const mineru = new MinerUClient({
 });
 const jobs = new TableCompareJobManager({ storageRoot, concurrency });
 const app = express();
+
+app.get(["/openapi.json", "/swagger.json"], (_request, response) => {
+  response.json(openApiDocument);
+});
+
+app.use(
+  "/docs",
+  swaggerUi.serve,
+  swaggerUi.setup(openApiDocument, {
+    customSiteTitle: "MinerU Semantic Table Compare API",
+    swaggerOptions: {
+      persistAuthorization: true,
+      displayRequestDuration: true,
+    },
+  }),
+);
 
 app.get("/health", async (_request, response) => {
   const mineruHealth = await mineru.health().catch((error) => ({

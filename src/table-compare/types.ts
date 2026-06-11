@@ -84,6 +84,11 @@ export interface TableComparisonResult {
   tableB: ExtractedTable;
   comparisonMode?: "semantic";
   baselineDocument?: "documentA" | "documentB";
+  selection?: {
+    rationale?: string;
+    documentA: TableSectionSelection;
+    documentB: TableSectionSelection;
+  };
   semantic?: {
     commonFields: string[];
     ignoredFieldsA: string[];
@@ -104,6 +109,15 @@ export interface TableComparisonResult {
     invokedByApi?: boolean;
     responseText?: string;
   };
+}
+
+export interface TableSectionSelection {
+  tableIndex: number;
+  headerRowIndexes: number[];
+  dataRowIndexes: number[];
+  totalRowIndexes: number[];
+  ignoredRowIndexes: number[];
+  rationale: string;
 }
 
 export interface CompareJobRecord {
