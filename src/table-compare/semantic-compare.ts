@@ -470,17 +470,25 @@ export function buildSemanticComparisonResult(
   const baselineDocument = options.baselineDocument ?? "documentB";
   const cellsA = indexCells(tableA);
   const cellsB = indexCells(tableB);
-  const ignoredTemplateDifferences = plan.differences.filter(isIgnoredTemplateShapeDifference);
-  const reportablePlanDifferences = plan.differences.filter((difference) => !isIgnoredTemplateShapeDifference(difference));
+  const ignoredTemplateDifferences = plan.differences.filter((difference) =>
+    isIgnoredTemplateDifference(difference, tableA, tableB, cellsA, cellsB),
+  );
+  const reportablePlanDifferences = plan.differences.filter(
+    (difference) => !isIgnoredTemplateDifference(difference, tableA, tableB, cellsA, cellsB),
+  );
   const different = plan.different && reportablePlanDifferences.length > 0;
   const differences = different
     ? reportablePlanDifferences.map((difference) => buildDifference(difference, tableA, tableB, cellsA, cellsB, baselineDocument))
     : [];
-  const explanation = different ? ensureExplanationCoversDifferences(plan.explanation, differences) : plan.explanation;
+  const explanation = different
+    ? ensureExplanationCoversDifferences(plan.explanation, differences)
+    : plan.different && ignoredTemplateDifferences.length > 0
+      ? explainIgnoredTemplateOnlyDifferences(ignoredTemplateDifferences)
+      : plan.explanation;
 
   return {
     different,
-    summary: plan.summary,
+    summary: different ? plan.summary : plan.different ? "No material table differences found." : plan.summary,
     explanation,
     differences,
     tableA,
@@ -509,13 +517,172 @@ export function buildSemanticComparisonResult(
   };
 }
 
-function isIgnoredTemplateShapeDifference(difference: SemanticComparisonPlan["differences"][number]): boolean {
-  if (difference.kind !== "shape_changed") {
+function isIgnoredTemplateDifference(
+  difference: SemanticComparisonPlan["differences"][number],
+  tableA: ExtractedTable,
+  tableB: ExtractedTable,
+  cellsA: Map<string, ExtractedCell>,
+  cellsB: Map<string, ExtractedCell>,
+): boolean {
+  if (isBlankPaddingRowDifference(difference, tableA, tableB, cellsA, cellsB)) {
+    return true;
+  }
+
+  if (isOneSidedComputedSummaryRowDifference(difference, tableA, tableB, cellsA, cellsB)) {
+    return true;
+  }
+
+  if (isOptionalTemplateFieldDifference(difference, tableA, tableB, cellsA, cellsB)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isBlankPaddingRowDifference(
+  difference: SemanticComparisonPlan["differences"][number],
+  tableA: ExtractedTable,
+  tableB: ExtractedTable,
+  cellsA: Map<string, ExtractedCell>,
+  cellsB: Map<string, ExtractedCell>,
+): boolean {
+  if (difference.kind !== "row_added" && difference.kind !== "row_removed") {
     return false;
   }
 
-  const detail = `${difference.field ?? ""} ${difference.explanation ?? ""}`.toLowerCase();
-  return /non[-\s]?material|non[-\s]?essential|does not affect|not affect verification/.test(detail);
+  const evidence = differenceEvidenceText(difference, tableA, tableB, cellsA, cellsB);
+  const rowA = rowTextForDifference(difference, "documentA", tableA, cellsA);
+  const rowB = rowTextForDifference(difference, "documentB", tableB, cellsB);
+  return /blank|empty|padding|spacer/.test(evidence) || (isBlankOptionalValue(rowA) && isBlankOptionalValue(rowB));
+}
+
+function isOneSidedComputedSummaryRowDifference(
+  difference: SemanticComparisonPlan["differences"][number],
+  tableA: ExtractedTable,
+  tableB: ExtractedTable,
+  cellsA: Map<string, ExtractedCell>,
+  cellsB: Map<string, ExtractedCell>,
+): boolean {
+  if (difference.kind !== "row_added" && difference.kind !== "row_removed") {
+    return false;
+  }
+
+  const evidence = differenceEvidenceText(difference, tableA, tableB, cellsA, cellsB);
+  return /total|subtotal|summary|合计|总计|小计/.test(evidence);
+}
+
+function isOptionalTemplateFieldDifference(
+  difference: SemanticComparisonPlan["differences"][number],
+  tableA: ExtractedTable,
+  tableB: ExtractedTable,
+  cellsA: Map<string, ExtractedCell>,
+  cellsB: Map<string, ExtractedCell>,
+): boolean {
+  const evidence = differenceEvidenceText(difference, tableA, tableB, cellsA, cellsB);
+  if (!/remarks?|notes?|comments?|memo|备注|说明/.test(evidence)) {
+    return false;
+  }
+
+  if (difference.kind === "shape_changed") {
+    if (/non[-\s]?material|non[-\s]?essential|does not affect|not affect verification/.test(evidence)) {
+      return true;
+    }
+    return (
+      /line note|placeholder|generic|template/.test(evidence) &&
+      /empty|blank|absent|missing|no remarks|no notes|no equivalent|no remarks data|no notes data/.test(evidence)
+    );
+  }
+
+  if (difference.kind !== "cell_changed") {
+    return false;
+  }
+
+  const before = normalizeOptionalFieldValue(difference.before);
+  const after = normalizeOptionalFieldValue(difference.after);
+  return (
+    before !== after &&
+    ((isBlankOptionalValue(before) && isGenericOptionalValue(after)) || (isBlankOptionalValue(after) && isGenericOptionalValue(before)))
+  );
+}
+
+function differenceEvidenceText(
+  difference: SemanticComparisonPlan["differences"][number],
+  tableA: ExtractedTable,
+  tableB: ExtractedTable,
+  cellsA: Map<string, ExtractedCell>,
+  cellsB: Map<string, ExtractedCell>,
+): string {
+  const cellA = difference.cellRefA ? cellsA.get(difference.cellRefA) : undefined;
+  const cellB = difference.cellRefB ? cellsB.get(difference.cellRefB) : undefined;
+  return [
+    difference.field,
+    difference.before,
+    difference.after,
+    difference.explanation,
+    cellA?.text,
+    cellB?.text,
+    cellA ? headerTextForCell(tableA, cellA) : undefined,
+    cellB ? headerTextForCell(tableB, cellB) : undefined,
+    rowTextForDifference(difference, "documentA", tableA, cellsA),
+    rowTextForDifference(difference, "documentB", tableB, cellsB),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+function rowTextForDifference(
+  difference: SemanticComparisonPlan["differences"][number],
+  document: "documentA" | "documentB",
+  table: ExtractedTable,
+  cells: Map<string, ExtractedCell>,
+): string {
+  const explicitRowIndex = document === "documentA" ? difference.rowIndexA : difference.rowIndexB;
+  const cellRef = document === "documentA" ? difference.cellRefA : difference.cellRefB;
+  const rowIndex = explicitRowIndex ?? (cellRef ? cells.get(cellRef)?.rowIndex : undefined);
+  if (rowIndex === undefined || rowIndex === null) {
+    return "";
+  }
+
+  return cellsForRow(table, rowIndex)
+    .sort((a, b) => a.colIndex - b.colIndex)
+    .map((cell) => cell.text.trim())
+    .filter(Boolean)
+    .join(" ");
+}
+
+function headerTextForCell(table: ExtractedTable, cell: ExtractedCell): string {
+  const headerRowIndex = Math.min(...table.cells.map((candidate) => candidate.rowIndex));
+  const headerCell = table.cells
+    .filter((candidate) => candidate.rowIndex === headerRowIndex)
+    .find((candidate) => rangesOverlap(candidate.colIndex, candidate.colIndex + candidate.colSpan, cell.colIndex, cell.colIndex + cell.colSpan));
+  return headerCell?.text ?? "";
+}
+
+function rangesOverlap(startA: number, endA: number, startB: number, endB: number): boolean {
+  return startA < endB && startB < endA;
+}
+
+function normalizeOptionalFieldValue(value: string | null | undefined): string {
+  return (value ?? "").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function isBlankOptionalValue(value: string): boolean {
+  return value === "";
+}
+
+function isGenericOptionalValue(value: string): boolean {
+  return isBlankOptionalValue(value) || /^(line note|note|remarks?|comment|n\/a|na|none|null|-|—)$/.test(value);
+}
+
+function explainIgnoredTemplateOnlyDifferences(differences: SemanticComparisonPlan["differences"]): string {
+  const refs = differences
+    .map((difference) => difference.cellRefB ?? difference.cellRefA ?? difference.field)
+    .filter(Boolean)
+    .join(", ");
+  return `No material table differences found. Only optional template-only fields or computed summary rows differed${
+    refs ? ` (${refs})` : ""
+  }, so those fields were ignored for business-content comparison.`;
 }
 
 function ensureExplanationCoversDifferences(explanation: string, differences: TableDifference[]): string {

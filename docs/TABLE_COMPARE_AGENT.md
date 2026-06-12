@@ -7,21 +7,22 @@ This module adds a Mastra-facing table comparison agent on top of the local GPU-
 Request flow:
 
 1. `POST /v1/table-comparisons` accepts `documentA` and `documentB` as multipart uploads.
-2. The async API stores both inputs under `data/table-compare/input/<job_id>/`.
-3. A background worker calls `src/table-compare/workflow.ts`.
-4. `workflow.ts` retrieves `semanticTableCompareAgent` from the Mastra registry and calls `agent.generate(...)`.
-5. The semantic agent invokes `parse-document-pair-tables-with-mineru` once with both input paths.
-6. The MinerU tool submits both documents to the local MinerU API.
-7. MinerU parses each document on the GPU and returns structured output.
-8. The table extractor reads MinerU `content_list` and `middle_json`:
+2. The async API stores both inputs under `data/table-compare/jobs/<job_id>/input/`.
+3. `src/table-compare/job-manager.ts` enqueues a BullMQ job in Redis.
+4. `src/table-compare/worker.ts` claims the job and calls `src/table-compare/workflow.ts`.
+5. `workflow.ts` retrieves `semanticTableCompareAgent` from the Mastra registry and calls `agent.generate(...)`.
+6. The semantic agent invokes `parse-document-pair-tables-with-mineru` once with both input paths.
+7. The MinerU tool submits both documents to the local MinerU API.
+8. MinerU parses each document on the GPU and returns structured output.
+9. The table extractor reads MinerU `content_list` and `middle_json`:
    - table HTML from `table_body`
    - precise page-space table body bounding boxes from `middle_json` table spans
    - page geometry from `middle_json.pdf_info[].page_size`
-9. For PDF inputs, the geometry refiner renders the page and detects actual table ruling lines inside the MinerU table bbox.
-10. `workflow.ts` builds a compact semantic evidence prompt from the parsed cell grid and same-grid candidate differences.
-11. The same semantic agent returns a JSON comparison plan with row matches, changed cell refs, explanations, and ignored non-material fields.
-12. `semantic-compare.ts` validates the plan and maps refs such as `C3` back to MinerU-derived bounding boxes.
-13. The redline renderer draws red boxes on top of the selected baseline document and writes `redline.pdf`.
+10. For PDF inputs, the geometry refiner renders the page and detects actual table ruling lines inside the MinerU table bbox.
+11. `workflow.ts` builds a compact semantic evidence prompt from the parsed cell grid and same-grid candidate differences.
+12. The same semantic agent returns a JSON comparison plan with row matches, changed cell refs, explanations, and ignored non-material fields.
+13. `semantic-compare.ts` validates the plan, applies deterministic template-noise cleanup, and maps refs such as `C3` back to MinerU-derived bounding boxes.
+14. The redline renderer draws red boxes on top of the selected baseline document and writes `redline.pdf`.
 
 The API does not wait for parsing to finish. It returns a job id immediately and exposes polling endpoints, matching the async pattern used by the existing Python parse API.
 
@@ -38,12 +39,14 @@ In the current observed MinerU output, precise table-body boxes are available in
 ## Files
 
 - `src/table-compare/server.ts`: Express async API for table comparison jobs.
-- `src/table-compare/job-manager.ts`: in-memory queue, upload persistence, worker concurrency, and job state.
+- `src/table-compare/job-manager.ts`: upload persistence plus BullMQ job creation/status/result access.
+- `src/table-compare/queue.ts`: shared BullMQ queue name and Redis connection options.
+- `src/table-compare/worker.ts`: BullMQ worker process that runs `compareTwoDocuments(...)`.
 - `src/table-compare/mineru-client.ts`: local MinerU `/tasks` client with submit, poll, and result retrieval.
 - `src/table-compare/table-extractor.ts`: converts MinerU output into tables, cells, bboxes, and page geometry.
 - `src/table-compare/table-geometry.ts`: renders PDF pages with Poppler and detects actual table ruling lines for non-uniform cell bboxes.
 - `src/table-compare/table-compare.ts`: legacy exact cell-by-cell comparison helper for focused diagnostics.
-- `src/table-compare/semantic-compare.ts`: validates semantic-agent JSON plans and maps returned cell refs to MinerU-derived boxes.
+- `src/table-compare/semantic-compare.ts`: validates semantic-agent JSON plans, filters template-only semantic noise, and maps returned cell refs to MinerU-derived boxes.
 - `src/table-compare/redline.ts`: PDF overlay rendering with `pdf-lib`.
 - `src/table-compare/workflow.ts`: API-to-agent bridge; calls `semanticTableCompareAgent.generate(...)`, requires MinerU parse tool calls, runs semantic judgement, and writes the redline.
 - `src/mastra/tools/mineru-table-tools.ts`: MinerU parsing tool and shared parsing helper.
@@ -86,7 +89,7 @@ source ~/.zshrc
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}"
 export MASTRA_MODEL="${MASTRA_MODEL:-anthropic/deepseek-v4-flash}"
 set +a
-docker compose --profile fixtures up -d gotenberg mineru table-agent
+docker compose --profile fixtures up -d gotenberg mineru redis table-agent table-worker
 npm run create:table-examples
 ```
 
@@ -100,7 +103,7 @@ The examples include vector PDFs, PNG inputs parsed by MinerU, scanned/image-onl
 
 ## Docker
 
-Start the MinerU stack plus the table comparison API:
+Start the MinerU stack plus Redis, the table comparison API, and the worker:
 
 ```bash
 set -a
@@ -108,7 +111,7 @@ source ~/.zshrc
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-$ANTHROPIC_AUTH_TOKEN}"
 export MASTRA_MODEL="${MASTRA_MODEL:-anthropic/deepseek-v4-flash}"
 set +a
-docker compose up --build mineru table-agent
+docker compose up --build mineru redis table-agent table-worker
 ```
 
 Generate deterministic fixture PDFs:
@@ -125,13 +128,9 @@ Expected fixture truth:
 
 ## Concurrency
 
-The table comparison API has its own worker pool controlled by `TABLE_COMPARE_WORKER_CONCURRENCY`. Each job submits both documents to MinerU concurrently, so one comparison job can occupy two MinerU task slots. Keep:
+The table comparison worker pool is now `src/table-compare/worker.ts`, backed by BullMQ and Redis. `TABLE_COMPARE_WORKER_CONCURRENCY` controls how many BullMQ jobs one `table-worker` process can run at once. Each job may parse two documents, so keep this aligned with `MINERU_API_MAX_CONCURRENT_REQUESTS` and available GPU memory.
 
-```text
-TABLE_COMPARE_WORKER_CONCURRENCY * 2 <= MINERU_API_MAX_CONCURRENT_REQUESTS
-```
-
-unless a router or backpressure layer is added. The Docker default is `TABLE_COMPARE_WORKER_CONCURRENCY=2` with the existing MinerU default of `MINERU_API_MAX_CONCURRENT_REQUESTS=4`.
+See `docs/BULLMQ_REDIS_TABLE_COMPARE.md` for the full Redis/BullMQ job lifecycle.
 
 ## Limitations
 

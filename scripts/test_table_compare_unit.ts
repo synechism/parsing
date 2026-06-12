@@ -116,6 +116,74 @@ assert.equal(semanticInvoice.differences[0].field, "quantity");
 assert.ok(semanticInvoice.differences[0].bboxB, "semantic invoice difference should anchor to document B");
 assert.match(semanticInvoice.explanation, /Quantity for P-100 differs/);
 
+const statementAHtml =
+  "<table><tr><td>Part Code</td><td>Description</td><td>Quantity</td><td>Unit Price</td><td>Amount</td><td>Remarks</td></tr><tr><td>P-100</td><td>Valve</td><td>10</td><td>$12.50</td><td>$125.00</td><td>line note</td></tr><tr><td>P-200</td><td>Gasket</td><td>25</td><td>$1.10</td><td>$27.50</td><td>line note</td></tr><tr><td>TOTAL</td><td></td><td>35</td><td></td><td>$152.50</td><td></td></tr></table>";
+const statementBHtml =
+  "<table><tr><td>Part Code</td><td>Description</td><td>Quantity</td><td>Unit Price</td><td>Amount</td><td>Remarks</td></tr><tr><td>P-100</td><td>Valve</td><td>10</td><td>$12.50</td><td>$125.00</td><td></td></tr><tr><td>P-200</td><td>Gasket</td><td>25</td><td>$1.10</td><td>$27.50</td><td></td></tr></table>";
+const statementA = extractTablesFromMinerUResult(makeMinerUResult(statementAHtml), "statement-a.pdf", "unit-statement-a").tables[0];
+const statementB = extractTablesFromMinerUResult(makeMinerUResult(statementBHtml), "statement-b.pdf", "unit-statement-b").tables[0];
+const templateOnly = buildSemanticComparisonResult(
+  statementA,
+  statementB,
+  {
+    different: true,
+    summary: "Only template remarks and a one-sided total row differ.",
+    explanation: "All detail rows match. Document A has generic line note remarks and a TOTAL row absent from Document B.",
+    differences: [
+      {
+        kind: "cell_changed",
+        cellRefA: "F2",
+        cellRefB: "F2",
+        rowIndexA: 1,
+        rowIndexB: 1,
+        field: "Remarks",
+        before: "line note",
+        after: "",
+        explanation: "Generic placeholder remark is absent from the other template.",
+      },
+      {
+        kind: "row_added",
+        rowIndexA: 3,
+        rowIndexB: null,
+        field: "TOTAL row",
+        before: "TOTAL",
+        after: null,
+        explanation: "Document A has a computed TOTAL row that is absent from Document B.",
+      },
+    ],
+  },
+  { baselineDocument: "documentB" },
+);
+assert.equal(templateOnly.different, false, "generic remarks and one-sided computed totals should be ignored");
+assert.equal(templateOnly.differences.length, 0);
+assert.match(templateOnly.explanation, /No material table differences/);
+
+const materialNote = buildSemanticComparisonResult(
+  statementA,
+  statementB,
+  {
+    different: true,
+    summary: "A real shipping note is missing.",
+    explanation: "The note 'ship cold chain' is missing from Document B.",
+    differences: [
+      {
+        kind: "cell_changed",
+        cellRefA: "F2",
+        cellRefB: "F2",
+        rowIndexA: 1,
+        rowIndexB: 1,
+        field: "Remarks",
+        before: "ship cold chain",
+        after: "",
+        explanation: "Document A has a material handling note that is blank in Document B.",
+      },
+    ],
+  },
+  { baselineDocument: "documentB" },
+);
+assert.equal(materialNote.different, true, "non-generic notes should remain material");
+assert.equal(materialNote.differences.length, 1);
+
 const blankPdfPath = path.join(artifactDir, "blank.pdf");
 const redlinePdfPath = path.join(artifactDir, "unit-redline.pdf");
 const blank = await PDFDocument.create();

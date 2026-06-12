@@ -11,6 +11,7 @@
     "dev:mastra": "mastra dev",
     "build:mastra": "mastra build",
     "dev:table-agent": "tsx src/table-compare/server.ts",
+    "worker:table-agent": "tsx src/table-compare/worker.ts",
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && npm run test:table-unit",
     "test:table-unit": "tsx scripts/test_table_compare_unit.ts",
@@ -36,6 +37,7 @@
   "dependencies": {
     "@mastra/core": "^1.41.0",
     "@types/swagger-ui-express": "^4.1.8",
+    "bullmq": "^5.78.0",
     "cheerio": "^1.2.0",
     "express": "^5.2.1",
     "mastra": "^1.12.2",

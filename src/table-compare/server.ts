@@ -5,18 +5,19 @@ import swaggerUi from "swagger-ui-express";
 import { MinerUClient } from "./mineru-client";
 import { TableCompareJobManager } from "./job-manager";
 import { openApiDocument } from "./openapi";
+import type { CompareJobRecord } from "./types";
 
 const port = Number(process.env.TABLE_COMPARE_PORT ?? 8090);
 const storageRoot = process.env.TABLE_COMPARE_STORAGE_ROOT ?? process.env.STORAGE_ROOT ?? "/data";
 const mineruBaseUrl = process.env.MINERU_BASE_URL ?? "http://127.0.0.1:8000";
-const concurrency = Number(process.env.TABLE_COMPARE_WORKER_CONCURRENCY ?? process.env.WORKER_CONCURRENCY ?? 2);
+const workerConcurrency = Number(process.env.TABLE_COMPARE_WORKER_CONCURRENCY ?? process.env.WORKER_CONCURRENCY ?? 2);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: Number(process.env.MAX_UPLOAD_BYTES ?? 536_870_912) } });
 
 const mineru = new MinerUClient({
   baseUrl: mineruBaseUrl,
   resultTimeoutMs: Number(process.env.JOB_RESULT_TIMEOUT_SECONDS ?? 7200) * 1000,
 });
-const jobs = new TableCompareJobManager({ storageRoot, concurrency });
+const jobs = new TableCompareJobManager({ storageRoot });
 const app = express();
 
 app.get(["/openapi.json", "/swagger.json"], (_request, response) => {
@@ -43,8 +44,8 @@ app.get("/health", async (_request, response) => {
   response.json({
     status: "healthy",
     mineru: mineruHealth,
-    jobs: jobs.counts(),
-    workerConcurrency: jobs.concurrency,
+    jobs: await jobs.counts(),
+    workerConcurrency,
   });
 });
 
@@ -84,8 +85,8 @@ app.post(
   },
 );
 
-app.get("/v1/table-comparisons/:jobId", (request, response) => {
-  const job = jobs.get(request.params.jobId);
+app.get("/v1/table-comparisons/:jobId", async (request, response) => {
+  const job = await jobs.get(request.params.jobId);
   if (!job) {
     response.status(404).json({ detail: "Job not found" });
     return;
@@ -93,8 +94,8 @@ app.get("/v1/table-comparisons/:jobId", (request, response) => {
   response.json(serializeJob(job));
 });
 
-app.get("/v1/table-comparisons/:jobId/result", (request, response) => {
-  const job = jobs.get(request.params.jobId);
+app.get("/v1/table-comparisons/:jobId/result", async (request, response) => {
+  const job = await jobs.get(request.params.jobId);
   if (!job) {
     response.status(404).json({ detail: "Job not found" });
     return;
@@ -110,8 +111,8 @@ app.get("/v1/table-comparisons/:jobId/result", (request, response) => {
   response.json(job.result);
 });
 
-app.get("/v1/table-comparisons/:jobId/redline.pdf", (request, response) => {
-  const job = jobs.get(request.params.jobId);
+app.get("/v1/table-comparisons/:jobId/redline.pdf", async (request, response) => {
+  const job = await jobs.get(request.params.jobId);
   if (!job) {
     response.status(404).json({ detail: "Job not found" });
     return;
@@ -127,14 +128,24 @@ app.use((error: unknown, _request: express.Request, response: express.Response, 
   response.status(500).json({ detail: error instanceof Error ? error.message : String(error) });
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`table comparison API listening on :${port}`);
 });
 
-function serializeJob(job: ReturnType<TableCompareJobManager["get"]>) {
-  if (!job) {
-    return undefined;
-  }
+async function shutdown(): Promise<void> {
+  server.close();
+  await jobs.close();
+}
+
+process.once("SIGTERM", () => {
+  void shutdown().finally(() => process.exit(0));
+});
+
+process.once("SIGINT", () => {
+  void shutdown().finally(() => process.exit(0));
+});
+
+function serializeJob(job: CompareJobRecord) {
   return {
     jobId: job.id,
     status: job.status,

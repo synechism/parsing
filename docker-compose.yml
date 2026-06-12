@@ -1,4 +1,15 @@
 services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
   mineru:
     image: ${MINERU_IMAGE:-mineru-api:latest}
     gpus: all
@@ -55,10 +66,14 @@ services:
     image: table-compare-mastra-agent:local
     user: "${HOST_UID:-1001}:${HOST_GID:-1001}"
     depends_on:
+      redis:
+        condition: service_healthy
       mineru:
         condition: service_healthy
     environment:
       MINERU_BASE_URL: http://mineru:8000
+      REDIS_URL: redis://redis:6379
+      TABLE_COMPARE_QUEUE_NAME: ${TABLE_COMPARE_QUEUE_NAME:-table-comparisons}
       TABLE_COMPARE_STORAGE_ROOT: /data
       TABLE_COMPARE_WORKER_CONCURRENCY: ${TABLE_COMPARE_WORKER_CONCURRENCY:-4}
       JOB_RESULT_TIMEOUT_SECONDS: ${JOB_RESULT_TIMEOUT_SECONDS:-7200}
@@ -73,6 +88,33 @@ services:
     ports:
       - "8090:8090"
 
+  table-worker:
+    build:
+      context: .
+      dockerfile: docker/mastra-agent.Dockerfile
+    image: table-compare-mastra-agent:local
+    user: "${HOST_UID:-1001}:${HOST_GID:-1001}"
+    depends_on:
+      redis:
+        condition: service_healthy
+      mineru:
+        condition: service_healthy
+    command: ["sh", "-c", "export ANTHROPIC_API_KEY=\"$${ANTHROPIC_API_KEY:-$${ANTHROPIC_AUTH_TOKEN}}\"; npm run worker:table-agent"]
+    environment:
+      MINERU_BASE_URL: http://mineru:8000
+      REDIS_URL: redis://redis:6379
+      TABLE_COMPARE_QUEUE_NAME: ${TABLE_COMPARE_QUEUE_NAME:-table-comparisons}
+      TABLE_COMPARE_STORAGE_ROOT: /data
+      TABLE_COMPARE_WORKER_CONCURRENCY: ${TABLE_COMPARE_WORKER_CONCURRENCY:-4}
+      JOB_RESULT_TIMEOUT_SECONDS: ${JOB_RESULT_TIMEOUT_SECONDS:-7200}
+      MASTRA_MODEL: ${MASTRA_MODEL:-anthropic/deepseek-v4-flash}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
+    volumes:
+      - ./data:/data
+
   gotenberg:
     image: gotenberg/gotenberg:8
     profiles: ["fixtures"]
@@ -81,3 +123,4 @@ services:
 
 volumes:
   mineru-output:
+  redis-data:
